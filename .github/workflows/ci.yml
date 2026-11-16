@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lua:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lunarmodules/luacheck@v1
+        with:
+          args: .
+      - uses: leafo/gh-actions-lua@v10
+        with:
+          luaVersion: "5.1.5"
+      - name: Lua tests (mock, layout, text, dump, lint, LibUIShots-1.0)
+        run: lua tests/run.lua
+      - name: Example dump and lint
+        run: lua examples/dump_example.lua --out "$RUNNER_TEMP/dump"
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: leafo/gh-actions-lua@v10
+        with:
+          luaVersion: "5.1.5"
+      - name: Ruff
+        run: |
+          uvx ruff check python tests
+          uvx ruff format --check python tests
+      - name: Python tests (render and lint the example without a game install)
+        run: uv run --script tests/test_cli.py

@@ -1,0 +1,6 @@
+## Interface: 110000
+## Title: Harness Example
+## Notes: A tiny addon the harness's own tests build: a window with a few deliberate layout mistakes.
+## SavedVariables: HarnessExampleDB
+
+HarnessExample.lua

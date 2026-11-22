@@ -11,10 +11,13 @@ Needs `lua` (5.1) on PATH: it dumps the example addon first, then renders and li
 
 from __future__ import annotations
 
+import argparse
+import contextlib
 import io
 import json
 import math
 import os
+import random
 import shutil
 import struct
 import subprocess
@@ -30,8 +33,9 @@ sys.path.insert(0, str(ROOT / "python"))
 import casc  # noqa: E402
 import check  # noqa: E402
 import db2  # noqa: E402
+import visual  # noqa: E402
 import wowui  # noqa: E402
-from PIL import Image  # noqa: E402
+from PIL import Image, ImageSequence  # noqa: E402
 
 
 def test_name_hash():
@@ -998,6 +1002,381 @@ def test_check_example_addon_is_checkable():
     findings, checked, _ = check.check_tree(ROOT, cfg, ["examples", "lib"])
     assert checked >= 3, checked
     assert all(f.rule in check.RULES for f in findings)
+
+
+def _quiet(argv):
+    """wowui.main(argv) with its output captured: (exit code, stdout)."""
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        code = wowui.main(argv)
+    return code, out.getvalue()
+
+
+def _frame_png(path: Path, step: int, size=(60, 40)):
+    """A dark frame with a coloured block that moves with `step`: every frame differs from the next."""
+    img = Image.new("RGB", size, (20, 22, 30))
+    colour = [(220, 40, 40), (40, 200, 60), (60, 90, 230), (230, 200, 40), (200, 60, 200)][step % 5]
+    for x in range(5 + step % 5 * 8, 17 + step % 5 * 8):
+        for y in range(8, 20):
+            img.putpixel((x, y), colour)
+    img.save(path)
+    return colour
+
+
+def _gif_frames(path: Path):
+    with Image.open(path) as im:
+        return [(f.convert("RGB"), f.info.get("duration")) for f in ImageSequence.Iterator(im)], im.info.get("loop")
+
+
+def test_gif_from_frames_keeps_count_durations_and_is_deterministic():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        for i in range(4):
+            _frame_png(tmp / f"f{i}.png", i)
+        out = tmp / "a.gif"
+        argv = ["gif", str(tmp / "f*.png"), "--out", str(out), "--ms", "100", "--last-ms", "300"]
+        assert _quiet(argv)[0] == 0
+        frames, loop = _gif_frames(out)
+        assert len(frames) == 4
+        assert [d for _, d in frames] == [100, 100, 100, 300], "per-frame time, the last one rests longer"
+        assert loop == 0, "loops forever by default"
+        assert frames[0][0].size == (60, 40), "no caption, no band"
+        first = out.read_bytes()
+        out.unlink()
+        assert _quiet(argv)[0] == 0
+        assert out.read_bytes() == first, "the same input gives the same bytes"
+        assert _quiet([*argv[:-4], "--out", str(out), "--no-loop"])[0] == 0
+        assert _gif_frames(out)[1] is None, "--no-loop plays once"
+
+
+def test_gif_orders_sequence_frames_by_number_and_reads_captions_from_dumps():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        png, dump = tmp / "png", tmp / "dump"
+        png.mkdir()
+        dump.mkdir()
+        colours = {}
+        for n in (2, 10, 1):  # a plain text sort would put 10 before 2
+            colours[n] = _frame_png(png / f"seq-pick-{n:02d}.png", n)
+        _frame_png(png / "other.png", 0)
+        (dump / "seq-pick-01.json").write_text(json.dumps({"meta": {"caption": "First step"}}), encoding="utf-8")
+        plain = tmp / "plain.gif"
+        assert _quiet(["gif", "--sequence", "pick", "--png", str(png), "--out", str(plain), "--ms", "50"])[0] == 0
+        frames, _ = _gif_frames(plain)
+        assert len(frames) == 3 and frames[0][0].size == (60, 40), (
+            "frames of the named sequence only, no dumps no captions"
+        )
+        for (img, _), n in zip(frames, (1, 2, 10), strict=True):
+            x = 10 + n % 5 * 8
+            assert img.getpixel((x, 12)) == colours[n], f"frame for step {n} is in step order"
+        captioned = tmp / "captioned.gif"
+        args = ["gif", "--sequence", "pick", "--png", str(png), "--dump", str(dump), "--out", str(captioned)]
+        assert _quiet(args)[0] == 0
+        frames, _ = _gif_frames(captioned)
+        assert frames[0][0].width == 60 and frames[0][0].height > 40, "a caption in the dump adds the band"
+        band = frames[0][0].crop((0, 41, 60, frames[0][0].height))
+        assert len({band.getpixel((x, y)) for x in range(60) for y in range(band.height)}) > 2, "the caption is drawn"
+        assert frames[0][0].getpixel((30, 38)) == (20, 22, 30), "the picture itself is untouched"
+        try:
+            _quiet(["gif", "--sequence", "missing", "--png", str(png), "--out", str(plain)])
+        except SystemExit as e:
+            assert "seq-missing-NN" in str(e)
+        else:
+            raise AssertionError("an unknown sequence is an error")
+
+
+def test_gif_spec_crop_width_and_frame_options():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        for i in range(3):
+            _frame_png(tmp / f"v{i}.png", i)
+        spec = {
+            "name": "demo",
+            "frames": [
+                {"view": "v0", "caption": "One", "ms": 200},
+                {"file": "v1.png", "caption": "Two"},
+                "v2.png",
+            ],
+            "crop": [0, 0, 40, 20],
+            "width": 80,
+            "ms": 120,
+            "lastMs": 500,
+        }
+        (tmp / "spec.json").write_text(json.dumps(spec), encoding="utf-8")
+        out = tmp / "demo.gif"
+        assert _quiet(["gif", "--spec", str(tmp / "spec.json"), "--out", str(out)])[0] == 0
+        frames, _ = _gif_frames(out)
+        assert [d for _, d in frames] == [200, 120, 500]
+        assert frames[0][0].width == 80, "the crop is scaled to the width"
+        assert frames[0][0].height > 40, "40x20 scaled to 80 wide is 40 high, plus the caption band"
+        # Several sequences in one spec go to a folder.
+        (tmp / "spec.json").write_text(json.dumps([spec, {**spec, "name": "second"}]), encoding="utf-8")
+        assert _quiet(["gif", "--spec", str(tmp / "spec.json"), "--out", str(tmp / "gifs")])[0] == 0
+        assert (tmp / "gifs" / "demo.gif").exists() and (tmp / "gifs" / "second.gif").exists()
+
+
+def test_gif_auto_crop_trims_the_shared_background():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        for i in range(2):
+            _frame_png(tmp / f"f{i}.png", i, size=(100, 80))  # the blocks sit at x 5..28, y 8..19
+        out = tmp / "auto.gif"
+        assert _quiet(["gif", str(tmp / "f*.png"), "--out", str(out), "--crop", "auto"])[0] == 0
+        assert _gif_frames(out)[0][0][0].size == (20, 12), "the two blocks together span x 5..24"
+
+
+def test_gif_size_budget_reduces_colours_then_width_and_reports_failure():
+    rng = random.Random(7)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        for i in range(3):
+            img = Image.new("RGB", (240, 180))
+            img.putdata([(rng.randrange(256), rng.randrange(256), rng.randrange(256)) for _ in range(240 * 180)])
+            img.save(tmp / f"n{i}.png")
+        full = tmp / "full.gif"
+        assert _quiet(["gif", str(tmp / "n*.png"), "--out", str(full)])[0] == 0
+        budget = full.stat().st_size // 3
+        small = tmp / "small.gif"
+        argv = ["gif", str(tmp / "n*.png"), "--out", str(small), "--min-width", "60", "--max-bytes", str(budget)]
+        code, out = _quiet(argv)
+        assert code == 0 and small.stat().st_size <= budget, "the budget is honoured"
+        assert "reduced:" in out and "colours" in out, out
+        frames, _ = _gif_frames(small)
+        assert len(frames) == 3
+        nope = tmp / "nope.gif"
+        code, _ = _quiet(["gif", str(tmp / "n*.png"), "--out", str(nope), "--min-width", "60", "--max-bytes", "100"])
+        assert code == 1 and not nope.exists(), "a budget nothing fits is an error, and nothing is written"
+
+
+def test_gif_budget_ladder_ends_with_a_tiny_min_width():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        for i in range(2):
+            Image.new("RGB", (8, 8), (i * 100, 5, 5)).save(tmp / f"f{i}.png")
+        out = tmp / "o.gif"
+        # The ladder 8, 7, 6, ... 1 must end even though 90% of 4 rounds back to 4.
+        code, _ = _quiet(["gif", str(tmp / "f*.png"), "--out", str(out), "--min-width", "1", "--max-bytes", "10"])
+        assert code == 1 and not out.exists()
+
+
+def test_gif_auto_crop_of_an_all_background_frame_is_no_crop():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        _solid(tmp / "f0.png", size=(30, 20))
+        _solid(tmp / "f1.png", size=(30, 20))
+        out = tmp / "o.gif"
+        assert _quiet(["gif", str(tmp / "f*.png"), "--out", str(out), "--crop", "auto"])[0] == 0
+        assert _gif_frames(out)[0][0][0].size == (30, 20)
+
+
+def test_compare_ignores_hidden_colour_of_transparent_pixels_and_reads_other_modes():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        a, b = str(tmp / "a.png"), str(tmp / "b.png")
+        Image.new("RGBA", (4, 4), (0, 0, 0, 0)).save(a)
+        Image.new("RGBA", (4, 4), (200, 10, 10, 0)).save(b)
+        assert _quiet(["compare", a, b])[0] == 0, "fully transparent on both sides is the same"
+        Image.new("RGBA", (4, 4), (200, 10, 10, 1)).save(b)
+        assert _quiet(["compare", a, b])[0] == 1, "a visible difference in alpha still counts"
+        Image.new("I;16", (4, 4), 1000).save(a)
+        Image.new("I;16", (4, 4), 2000).save(b)
+        code, out = _quiet(["compare", a, b])
+        assert code == 1 and "16 of 16" in out, "16-bit grey is scaled, not clipped to white"
+        Image.new("P", (4, 4), 0).save(a)
+        Image.new("LA", (4, 4), (0, 255)).save(b)
+        assert _quiet(["compare", a, b])[0] == 0, "palette and grey-alpha images are normalised"
+
+
+def test_compare_folders_without_common_files_and_same_stem_outputs():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        for d in ("x", "y", "o1", "o2"):
+            (tmp / d).mkdir()
+        try:
+            _quiet(["compare", str(tmp / "x"), str(tmp / "y")])
+        except SystemExit as e:
+            assert e.code == 2, "empty folders are unusable input, not 'same'"
+        else:
+            raise AssertionError("empty folders must not pass")
+        _solid(tmp / "x" / "only.png")
+        try:
+            _quiet(["compare", str(tmp / "x"), str(tmp / "y")])
+        except SystemExit as e:
+            assert e.code == 2
+        else:
+            raise AssertionError("no file in common must not pass")
+        # a.png and a.jpg are two images: both outputs exist, under different names.
+        for d in ("o1", "o2"):
+            _solid(tmp / d / "a.png")
+            _solid(tmp / d / "a.jpg")
+        code, _ = _quiet(["compare", str(tmp / "o1"), str(tmp / "o2"), "--out", str(tmp / "out")])
+        assert code == 0
+        assert sorted(p.name for p in (tmp / "out").iterdir()) == ["a.jpg.png", "a.png.png"]
+
+
+def test_parse_size_and_box():
+    assert visual.parse_size("3000") == 3000
+    assert visual.parse_size("500KB") == 512000
+    assert visual.parse_size("1.5m") == 1572864
+    assert visual.parse_box("1, 2,30,40") == (1, 2, 30, 40)
+
+
+def _solid(path: Path, size=(100, 60), colour=(30, 60, 90)):
+    Image.new("RGB", size, colour).save(path)
+
+
+def test_compare_identical_and_changed_pixels():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        _solid(tmp / "a.png")
+        _solid(tmp / "b.png")
+        code, out = _quiet(["compare", str(tmp / "a.png"), str(tmp / "b.png"), "--out", str(tmp / "d.png")])
+        assert code == 0 and "0 of 6000 pixels changed" in out, out
+        with Image.open(tmp / "d.png") as d:
+            assert d.size == (3 * 100 + 2 * visual.PANEL_GAP, 60 + visual.PANEL_HEAD)
+        img = Image.open(tmp / "b.png")
+        img.putpixel((10, 10), (30, 60, 100))  # one pixel, 10 off in blue
+        img.save(tmp / "b.png")
+        code, out = _quiet(["compare", str(tmp / "a.png"), str(tmp / "b.png")])
+        assert code == 1 and "1 of 6000 pixels changed" in out, out
+        assert _quiet(["compare", str(tmp / "a.png"), str(tmp / "b.png"), "--tolerance", "10"])[0] == 0, (
+            "10 is within 10"
+        )
+        assert _quiet(["compare", str(tmp / "a.png"), str(tmp / "b.png"), "--tolerance", "9"])[0] == 1
+        assert _quiet(["compare", str(tmp / "a.png"), str(tmp / "b.png"), "--threshold", "0.02"])[0] == 0, (
+            "1/6000 = 0.017%"
+        )
+        assert _quiet(["compare", str(tmp / "a.png"), str(tmp / "b.png"), "--threshold", "0.01"])[0] == 1
+        # The changed pixel shows in the diff panel, and the rest of it is A dimmed.
+        _quiet(["compare", str(tmp / "a.png"), str(tmp / "b.png"), "--out", str(tmp / "d.png")])
+        with Image.open(tmp / "d.png") as d:
+            x0 = 2 * (100 + visual.PANEL_GAP)
+            assert d.getpixel((x0 + 10, visual.PANEL_HEAD + 10)) == visual.HIGHLIGHT
+            assert d.getpixel((x0 + 50, visual.PANEL_HEAD + 30)) != visual.HIGHLIGHT
+        # A change outside the cropped region is not seen; a different size is a difference.
+        assert _quiet(["compare", str(tmp / "a.png"), str(tmp / "b.png"), "--crop", "20,20,50,30"])[0] == 0
+        _solid(tmp / "wide.png", size=(120, 60))
+        code, out = _quiet(["compare", str(tmp / "a.png"), str(tmp / "wide.png")])
+        assert code == 1 and "sizes differ" in out, out
+
+
+def test_compare_crop_zoom_labels_and_folders():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        for d in ("one", "two"):
+            (tmp / d).mkdir()
+            _solid(tmp / d / "same.png")
+            _solid(tmp / d / "changed.png")
+        img = Image.open(tmp / "two" / "changed.png")
+        img.putpixel((15, 12), (255, 255, 255))
+        img.save(tmp / "two" / "changed.png")
+        _solid(tmp / "two" / "extra.png")
+        code, out = _quiet(["compare", str(tmp / "one"), str(tmp / "two"), "--out", str(tmp / "out")])
+        assert code == 1, out
+        assert "changed.png: 1 of 6000" in out and "same.png: 0 of 6000" in out and "extra.png: only in B" in out, out
+        assert (tmp / "out" / "changed.png").exists() and (tmp / "out" / "same.png").exists()
+        out_png = tmp / "z.png"
+        args = ["compare", str(tmp / "one" / "changed.png"), str(tmp / "two" / "changed.png")]
+        code, _ = _quiet(
+            [*args, "--crop", "10,10,20,10", "--zoom", "3", "--labels", "before,after", "--out", str(out_png)]
+        )
+        assert code == 1
+        with Image.open(out_png) as z:
+            assert z.size == (3 * 60 + 2 * visual.PANEL_GAP, 30 + visual.PANEL_HEAD), (
+                "20x10 zoomed 3 times, three panels"
+            )
+            # Zoom is nearest neighbour: the changed pixel (15, 12) becomes a 3x3 block at (15 - 10) * 3, (12 - 10) * 3.
+            x0 = 2 * (60 + visual.PANEL_GAP)
+            for dx in range(3):
+                for dy in range(3):
+                    assert z.getpixel((x0 + 15 + dx, visual.PANEL_HEAD + 6 + dy)) == visual.HIGHLIGHT
+        try:
+            _quiet([*args, "--labels", "only-one"])
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("--labels wants two names")
+
+
+def test_atlas_search_sheet_layout_and_sheet():
+    # (file data ID, left, right, top, bottom, sheet width, sheet height, override width, override height, element)
+    atlases = {
+        "ui-b-blue": (1, 16, 32, 0, 16, 32, 32, 0, 0, 0),
+        "ui-a-red": (1, 0, 16, 0, 16, 32, 32, 0, 0, 0),
+        "other-wide": (1, 0, 32, 16, 20, 32, 32, 64, 8, 0),
+    }
+    assert visual.search_atlases(atlases, "UI-") == [("ui-a-red", 16, 16), ("ui-b-blue", 16, 16)], "sorted, case-blind"
+    assert visual.search_atlases(atlases, "wide") == [("other-wide", 64, 8)], (
+        "the override size wins, as in the listing"
+    )
+    assert visual.search_atlases(atlases, "nothing") == []
+    positions, size = visual.sheet_layout(5, 2, 32, pad=4, label_h=10)
+    assert positions == [(0, 0), (40, 0), (0, 50), (40, 50), (0, 100)]
+    assert size == (80, 150)
+    assert visual.sheet_layout(0, 4, 32)[1] == (0, 0)
+    # The real Game and Renderer on a synthetic sheet texture: left half red, right half blue.
+    game = wowui.Game(None, {})
+    game._atlases = atlases
+    sheet = Image.new("RGBA", (32, 32), (255, 0, 0, 255))
+    for x in range(16, 32):
+        for y in range(32):
+            sheet.putpixel((x, y), (0, 0, 255, 255))
+    game._images[(None, 1)] = sheet
+    renderer = wowui.Renderer(game, Path("."), 1.0)
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "sheet.png"
+        args = argparse.Namespace(search="ui-", sheet=str(out), filter="ui-", columns=2, cell=32, max=0)
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(io.StringIO()):
+            assert visual.atlas_tools(args, game, renderer) == 0
+        assert printed.getvalue().splitlines()[:2] == ["ui-a-red\t16\t16", "ui-b-blue\t16\t16"]
+        _, (w, h) = visual.sheet_layout(2, 2, 32)
+        with Image.open(out) as s:
+            assert s.size == (w, h)
+            pad = 6
+            assert s.getpixel((pad + 16, pad + 16)) == (255, 0, 0), "the first cell (sorted: ui-a-red) shows red"
+            assert s.getpixel((w // 2 + pad + 16, pad + 16)) == (0, 0, 255), "the second shows blue"
+            label = s.crop((0, 32 + 2 * pad, w // 2, h))
+            assert len(set(label.getdata())) > 2, "the name and size are written under the picture"
+        args = argparse.Namespace(search=None, sheet=str(out), filter="nothing", columns=2, cell=32, max=0)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            assert visual.atlas_tools(args, game, renderer) == 1, "nothing to draw is exit 1"
+        args = argparse.Namespace(search="wide", sheet=None, filter=None, columns=2, cell=32, max=0)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            assert visual.atlas_tools(args, game, renderer) == 0
+
+
+def test_example_sequence_to_gif():
+    lua = shutil.which("lua") or shutil.which("lua5.1")
+    if not lua:
+        print("   (skipped: no lua on PATH)")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        subprocess.run(
+            [lua, "examples/dump_example.lua", "--out", str(tmp / "dump")],
+            cwd=ROOT,
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
+        metas = [
+            json.loads((tmp / "dump" / f"seq-example-0{i}.json").read_text(encoding="utf-8"))["meta"] for i in (1, 2, 3)
+        ]
+        assert [m["step"] for m in metas] == [1, 2, 3] and metas[1]["caption"] == "Step 2 changes the text"
+        assert _quiet(["render", "--dump", str(tmp / "dump"), "--out", str(tmp / "png")])[0] == 0
+        gif = tmp / "example.gif"
+        code, _ = _quiet(
+            ["gif", "--sequence", "example", "--png", str(tmp / "png"), "--dump", str(tmp / "dump"), "--out", str(gif)]
+        )
+        assert code == 0
+        frames, _ = _gif_frames(gif)
+        with Image.open(tmp / "png" / "seq-example-01.png") as first:
+            assert len(frames) == 3 and frames[0][0].width == first.width and frames[0][0].height > first.height
+        # Step 3 differs from step 2 only in the swatch: the compare sees exactly that.
+        code, out = _quiet(
+            ["compare", str(tmp / "png" / "seq-example-02.png"), str(tmp / "png" / "seq-example-03.png")]
+        )
+        assert code == 1 and "pixels changed" in out
 
 
 def main():

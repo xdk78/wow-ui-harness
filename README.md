@@ -17,7 +17,7 @@ Built for addon developers and for coding agents that need to look at a UI they 
 | What | Where | Needs |
 |---|---|---|
 | Mock, layout, dump, lint, runner | `lua/wowui/` | Lua 5.1 |
-| Renderer, lint reader, game data | `python/wowui.py` (`casc.py`, `db2.py`) | Python 3.15+ through [uv](https://docs.astral.sh/uv/), which fetches it, a local game install for textures |
+| Renderer, lint reader, game data, GIFs, image compare | `python/wowui.py` (`casc.py`, `db2.py`, `visual.py`) | Python 3.15+ through [uv](https://docs.astral.sh/uv/), which fetches it, a local game install for textures |
 | Screenshot library | `lib/LibUIShots-1.0/` | the game, LibStub (CallbackHandler-1.0 optional) |
 
 ## Offline: dump, lint, render
@@ -175,6 +175,98 @@ heights), no pixels, no file contents and nothing from which an image could be r
 same kind of facts to every addon at run time (`GetFileIDFromPath`, `C_Texture.GetAtlasInfo`). This is the reasoning
 behind the format, not legal advice or a licence grant: whether to commit it is the addon author's call. The sizes of
 an addon's own files (`--addon`) come from that addon's files. Textures, fonts and renders stay out of the repository.
+
+### Sequences and animated GIFs
+
+An interaction (open a window, click a tab, tick a box) is several views, each the state after the next step. Declare
+them with `wowui.views` and the runner dumps one view per step, named `seq-<name>-NN`:
+
+```lua
+local Views = require("wowui.views")
+local views = { --[[ your other views ]] }
+for _, v in ipairs(Views.Sequence("pick-tab", {
+  function() MyAddon:Open() end,                                          -- a step is a function ...
+  { caption = "Click the Options tab", setup = function() MyAddon:ShowTab("options") end },   -- ... or a table
+  { caption = "Tick the box", setup = function() MyAddonCheck:Click() end },
+}, { window = function() return MyAddonFrame end, finish = function() MyAddon:Close() end })) do
+  views[#views + 1] = v
+end
+```
+
+Steps run cumulatively on one state: step 2 starts where step 1 left off, nothing is torn down between them; `finish`
+runs once after the last. A step table takes `setup`, `caption`, `window` (default: the sequence's) and `meta`. Each
+view's `meta` records `sequence`, `step`, `steps` and `caption` in its dump. With `--only seq-pick-tab-03` the steps
+before it run first without being dumped, so a single frame shows the same state as in a full run, and `finish` runs
+right after the last selected step. A step that throws stops the run (exit code 3), without `finish`.
+
+`gif` turns rendered frames into one animated GIF (Pillow only). Below, `wowui` stands for
+`uv run --script <harness>/python/wowui.py`; `--sequence` takes a name, a comma list or `all`.
+
+```sh
+wowui gif --sequence pick-tab --png <work>/png --dump <work>/dump --out <work>/pick-tab.gif     # seq-pick-tab-NN.png, captions from the dumps
+wowui gif "<work>/png/step-*.png" --out demo.gif --ms 600 --crop auto --max-bytes 2MB            # any files, in natural order
+wowui gif --spec sequences.json --png <work>/png --out <work>/gifs                              # a spec, one GIF per sequence
+```
+
+| Option | Meaning |
+|---|---|
+| `--crop x,y,w,h` / `auto` | cut every frame the same way; `auto` trims the background (the first frame's corner colour) around everything that changes (frames that are all background: no crop) |
+| `--scale f`, `--width px` | resize (smooth when shrinking, hard pixels when enlarging); `--width` wins |
+| `--ms n`, `--last-ms n` | time per frame (default 800 ms); the last frame rests twice as long unless `--last-ms` says otherwise |
+| `--colors n`, `--dither` | palette size (default 256, one palette for all frames so colours stay put); dithering is off by default, which keeps UI art clean |
+| `--loop n`, `--no-loop` | repeat count (default 0: forever) or play once |
+| `--no-captions`, `--counter` | captions are drawn in a band under the picture when any frame has one (from `--dump`, the spec or the file); `--counter` adds "n/total" |
+| `--max-bytes 3MB` | a size budget: the palette shrinks first (down to `--min-colors`, default 64), then the width by 10% steps (down to `--min-width`, default 240) until it fits; the command prints what it reduced, and exits 1 with nothing written when nothing fits |
+
+Frames of different sizes are centred on a canvas as large as the largest. Captions use the font Pillow carries
+(Aileron Regular, Latin letters), never a game font. A spec is JSON, one object or a list of them:
+
+```jsonc
+{
+  "name": "pick-tab",                       // the GIF's file name in --out (a folder)
+  "frames": [                               // or leave it out: the rendered seq-<sequence>-NN images ("sequence" defaults to name)
+    { "view": "seq-pick-tab-01", "caption": "Open it", "ms": 1000 },   // <png>/<view>.png; the caption defaults to the dump's
+    { "file": "extra/step.png" },                                      // relative to --png (default: the spec's folder)
+    "plain.png"
+  ],
+  "captions": ["..."],                      // with no "frames": one caption per seq-<name>-NN frame
+  "crop": [10, 12, 1020, 734],              // or "auto"
+  "scale": 1, "width": 720, "ms": 1200, "lastMs": 2400, "colors": 256, "minColors": 64, "minWidth": 240,
+  "dither": false, "loop": 0, "counter": false, "maxBytes": "3MB"
+}
+```
+
+Settings in a spec win over the command line. Identical neighbouring frames are merged into one longer frame by the
+GIF writer.
+
+### Compare two renders
+
+```sh
+wowui compare before.png after.png --out diff.png --labels before,after [--crop x,y,w,h] [--zoom 4] [--tolerance 0] [--threshold 0]
+wowui compare <render folder A> <render folder B> --out <folder>     # files with the same name
+```
+
+Writes one PNG: A | B | diff, where the diff shows the changed pixels highlighted over a dimmed A, with the count and
+percentage in its label. `--tolerance n` lets a pixel differ by up to n per channel (0-255) before it counts;
+`--threshold pct` is the percentage of changed pixels still counted as the same. `--crop` compares one region, `--zoom`
+enlarges the panels with hard pixels (a single changed pixel is hard to see otherwise). The exit code is 0 when the
+images are the same within the threshold and 1 when they differ (also for images of different sizes, unless `--crop` is
+given, and for a file only one folder has), so it works in CI; it is 2 when there is nothing to compare (two folders
+with no image of the same name). Folder files are matched by full name, extension included (`a.png` is not `a.jpg`);
+when two compared files share a stem the outputs are named `<full name>.png`. Pixels that are fully transparent on both
+sides count as equal. `--out` is optional: without it only the numbers print.
+
+### Find an atlas
+
+```sh
+wowui atlases --game "$G" --search "metal-corner"                          # names and sizes, case-insensitive
+wowui atlases --game "$G" --sheet <work>/sheet.png --filter "bag" --columns 10 --cell 64 --max 40
+```
+
+`--search` prints `name<TAB>width<TAB>height` for atlases whose name contains the text (the size is the one in the
+atlas listing). `--sheet` draws a contact sheet of the (filtered, name-sorted) atlases: each cut from its texture, fitted
+to a cell (small ones enlarged up to 4 times), with its name and size under it; `--max` caps the count (default 200,
+0 for all). Both read the client, so they need `--game`; like all game art, keep the sheet outside your repository.
 
 ### Lint
 
@@ -388,6 +480,7 @@ instead).
 | Used | For | Licence |
 |---|---|---|
 | [Pillow](https://python-pillow.org/) (dependency, not vendored) | image decoding (BLP through its BlpImagePlugin), drawing, FreeType text | MIT-CMU (HPND) |
+| [Aileron](https://dotcolon.net/fonts/aileron) Regular, the font Pillow (10.1 or later) carries for `ImageFont.load_default(size)`; not vendored here | captions of `gif`, labels of `compare` and `atlases --sheet` | Public domain (CC0), per its publisher |
 | [LibStub](https://www.wowace.com/projects/libstub) (vendored in `tests/vendor/` for the tests) | library versioning | Public domain |
 | CallbackHandler-1.0 (optional, not vendored) | the library's callbacks | Ace3 licence (BSD-style) |
 
@@ -400,8 +493,9 @@ vscode-wow-api project and the wowless headless client.
 
 ## Repository
 
-- `lua/wowui/` the Lua package (`mock`, `layout`, `text`, `ttf`, `dump`, `lint`, `runner`, `json`)
-- `python/` the command line (`wowui.py`), its game readers (`casc.py`, `db2.py`) and the static check (`check.py`)
+- `lua/wowui/` the Lua package (`mock`, `layout`, `text`, `ttf`, `dump`, `lint`, `runner`, `views`, `json`)
+- `python/` the command line (`wowui.py`), its visual tools (`visual.py`: `gif`, `compare`, atlas sheets), its game
+  readers (`casc.py`, `db2.py`) and the static check (`check.py`)
 - `lib/LibUIShots-1.0/` the in-game library
 - `examples/` a tiny addon and its dump script; `tests/` Lua tests (`lua tests/run.lua`) and Python tests
   (`uv run --script tests/test_cli.py`); `docs/` the dump format

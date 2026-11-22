@@ -9,7 +9,7 @@ Subcommands (run with `uv run --script <harness>/python/wowui.py <command> ...`)
   fonts    --game <client folder> --out <dir> [--file <game path> ...]
            Copy the client's font files (Fonts\\*.TTF) out of its CASC storage, for wowui.layout to measure text with
            (the dump's --font-root "Fonts\\=<dir>").
-  atlases  --game <client folder> --out <file>
+  atlases  --game <client folder> [--out <file>] [--search <text>] [--sheet <png> [--filter <text>] [--columns 8]]
            Every atlas the client knows, one "name<TAB>width<TAB>height" per line (the dump's --atlases).
   files    --game <client folder> --dump <dir> [--out <file>] [--sizes <json>] [--addon <Name>=<folder> ...]
            Which of the paths a dump asked GetFileIDFromPath about (or drew) the client has, "fileID<TAB>path" per
@@ -48,6 +48,7 @@ sys.path.insert(0, str(HERE))
 import casc as casc_mod  # noqa: E402
 import check as check_mod  # noqa: E402
 import db2  # noqa: E402
+import visual  # noqa: E402
 
 __version__ = "0.2.0"
 
@@ -1187,13 +1188,20 @@ def cmd_fonts(a):
 
 def cmd_atlases(a):
     g = Game(Path(a.game), {})
-    atl = g.atlases()
-    lines = []
-    for name, v in sorted(atl.items()):
-        w, h = (v[7] or (v[2] - v[1])), (v[8] or (v[4] - v[3]))
-        lines.append(f"{name}	{w}	{h}")
-    Path(a.out).write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"wowui: {len(lines)} atlases written to {a.out}")
+    if not (a.out or a.search is not None or a.sheet):
+        sys.exit("wowui: atlases wants --out, --search or --sheet")
+    code = 0
+    if a.out:
+        atl = g.atlases()
+        lines = []
+        for name, v in sorted(atl.items()):
+            w, h = (v[7] or (v[2] - v[1])), (v[8] or (v[4] - v[3]))
+            lines.append(f"{name}	{w}	{h}")
+        Path(a.out).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"wowui: {len(lines)} atlases written to {a.out}")
+    if a.search is not None or a.sheet:
+        code = visual.atlas_tools(a, g, Renderer(g, Path("."), 1.0))
+    return code
 
 
 SIZES_SCHEMA = "wowui-sizes/1"
@@ -1362,9 +1370,10 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p.add_argument("--file", action="append", help="another game path to copy")
     p.set_defaults(fn=cmd_fonts)
-    p = sub.add_parser("atlases", help="list the client's atlases")
+    p = sub.add_parser("atlases", help="list, search or draw the client's atlases")
     p.add_argument("--game", required=True)
-    p.add_argument("--out", required=True)
+    p.add_argument("--out", help="write every atlas name and size to this file")
+    visual.add_atlas_options(p)
     p.set_defaults(fn=cmd_atlases)
     p = sub.add_parser("files", help="which files a dump asked for exist in the client")
     p.add_argument("--game", required=True)
@@ -1392,6 +1401,7 @@ def main(argv=None):
     p = sub.add_parser("check", help="static safety check of an addon's Lua source")
     check_mod.add_arguments(p)
     p.set_defaults(fn=check_mod.run)
+    visual.add_commands(sub)
     a = ap.parse_args(argv)
     return a.fn(a) or 0
 

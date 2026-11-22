@@ -51,6 +51,43 @@ T.case("perf.count: errors go on; the previous hook is put back and keeps its ev
 	T.eq(Perf.count(function() end), 0, "nothing left behind either")
 end)
 
+T.case("perf.count: a previous hook sees the running code and balanced calls / returns", function()
+	local Perf = require("wowui.perf")
+	local sources, depth, inside = {}, 0, false
+	debug.sethook(function(event)
+		if event == "line" and inside then
+			sources[debug.getinfo(2, "S").short_src] = true
+		elseif event == "call" then
+			depth = depth + 1
+		else
+			depth = depth - 1
+		end
+	end, "crl")
+	local function leaf(x)
+		return x + 1
+	end
+	local function tail(x)
+		return leaf(x) -- a tail call: "tail return" in Lua 5.1
+	end
+	local before
+	Perf.count(function()
+		inside = true
+		before = depth
+		tail(1)
+		tail(2)
+		before = depth - before
+		inside = false
+	end)
+	debug.sethook()
+	T.eq(before, 0, "every call the hook saw also returned")
+	local perfSeen = false
+	for src in pairs(sources) do
+		perfSeen = perfSeen or src:find("perf.lua", 1, true) ~= nil
+	end
+	T.ok(not perfSeen, "line events name the code that runs, not wowui.perf")
+	T.eq(Perf.count(type, 1), 0, "a C function costs nothing of its own")
+end)
+
 T.case("perf.count: coroutines created inside are counted; nested counts add up", function()
 	local Perf = require("wowui.perf")
 	local plain = Perf.count(loop, 50)

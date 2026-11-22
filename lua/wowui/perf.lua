@@ -15,9 +15,11 @@
 --     instruction however much work it does, so budgets compare Lua code paths, not wall time.
 --   - It depends on the Lua build: Lua 5.1 and 5.2+ compile to different instruction sets, and LuaJIT does not run
 --     count hooks for compiled code. Record budgets with the Lua the tests run on in CI (5.1.5, as the game's).
---   - Coroutines that already existed before fn and are resumed by it are not counted (a hook is per coroutine).
---     One created by a coroutine.create the code saved in a local before counting is counted (Lua 5.1 copies the
---     hook into it) but keeps that hook afterwards.
+--   - Coroutines that already existed before fn and are resumed by it are not counted (a hook is per coroutine), nor
+--     ones made through a coroutine.create the code saved in a local before counting. Each coroutine fn creates
+--     adds the few instructions of the wrapper that installs the hook.
+--   - fn runs under pcall, so it cannot yield across Perf.count; if fn sets a hook itself, counting stops there. A
+--     hook set from C (debug.gethook says "external hook") is replaced while counting and not put back.
 --   - Counting is slow (a hook call per instruction): keep the measured work small.
 
 local Perf = {}
@@ -33,6 +35,8 @@ local function makeHook(box, prev, prevMask, prevCount)
 	local wantReturn = prevMask and prevMask:find("r", 1, true)
 	local wantCount = prev and prevCount and prevCount > 0
 	local sinceCount = 0
+	-- The previous hook is reached by a tail call, so it sees the running function at the level it expects
+	-- (debug.getinfo(2) in a coverage tool's line hook).
 	return function(event, line)
 		if event == "count" then
 			box.n = box.n + 1
@@ -40,12 +44,12 @@ local function makeHook(box, prev, prevMask, prevCount)
 				sinceCount = sinceCount + 1
 				if sinceCount >= prevCount then
 					sinceCount = 0
-					prev("count")
+					return prev("count")
 				end
 			end
-		elseif prev and ((event == "line" and wantLine) or ((event == "call" or event == "tail call") and wantCall)
-			or (event == "return" and wantReturn)) then
-			prev(event, line)
+		elseif prev and ((event == "line" and wantLine) or (event == "call" and wantCall)
+			or ((event == "return" or event == "tail return") and wantReturn)) then
+			return prev(event, line)
 		end
 	end
 end
@@ -64,6 +68,9 @@ local overhead -- instructions Perf.count spends around fn itself (measured once
 
 local function raw(fn, ...)
 	local prev, prevMask, prevCount = debug.gethook()
+	if type(prev) ~= "function" then -- none, or a hook set from C ("external hook"): nothing to pass on or put back
+		prev, prevMask, prevCount = nil, nil, nil
+	end
 	local box = { n = 0 }
 	local hook = makeHook(box, prev, prevMask, prevCount)
 	local mask = maskOf(prevMask)
@@ -118,7 +125,7 @@ function Perf.count(fn, ...)
 		overhead = raw(empty)
 	end
 	local r = pack(raw(fn, ...))
-	r[1] = r[1] - overhead
+	r[1] = math.max(0, r[1] - overhead) -- a C function has no RETURN of its own to take off
 	return unpack(r, 1, r.n)
 end
 

@@ -196,7 +196,8 @@ end
 Steps run cumulatively on one state: step 2 starts where step 1 left off, nothing is torn down between them; `finish`
 runs once after the last. A step table takes `setup`, `caption`, `window` (default: the sequence's) and `meta`. Each
 view's `meta` records `sequence`, `step`, `steps` and `caption` in its dump. With `--only seq-pick-tab-03` the steps
-before it run first without being dumped, so a single frame shows the same state as in a full run.
+before it run first without being dumped, so a single frame shows the same state as in a full run, and `finish` runs
+right after the last selected step. A step that throws stops the run (exit code 3), without `finish`.
 
 `gif` turns rendered frames into one animated GIF (Pillow only). Below, `wowui` stands for
 `uv run --script <harness>/python/wowui.py`; `--sequence` takes a name, a comma list or `all`.
@@ -209,7 +210,7 @@ wowui gif --spec sequences.json --png <work>/png --out <work>/gifs              
 
 | Option | Meaning |
 |---|---|
-| `--crop x,y,w,h` / `auto` | cut every frame the same way; `auto` trims the background (the first frame's corner colour) around everything that changes |
+| `--crop x,y,w,h` / `auto` | cut every frame the same way; `auto` trims the background (the first frame's corner colour) around everything that changes (frames that are all background: no crop) |
 | `--scale f`, `--width px` | resize (smooth when shrinking, hard pixels when enlarging); `--width` wins |
 | `--ms n`, `--last-ms n` | time per frame (default 800 ms); the last frame rests twice as long unless `--last-ms` says otherwise |
 | `--colors n`, `--dither` | palette size (default 256, one palette for all frames so colours stay put); dithering is off by default, which keeps UI art clean |
@@ -250,7 +251,10 @@ percentage in its label. `--tolerance n` lets a pixel differ by up to n per chan
 `--threshold pct` is the percentage of changed pixels still counted as the same. `--crop` compares one region, `--zoom`
 enlarges the panels with hard pixels (a single changed pixel is hard to see otherwise). The exit code is 0 when the
 images are the same within the threshold and 1 when they differ (also for images of different sizes, unless `--crop` is
-given, and for a file only one folder has), so it works in CI. `--out` is optional: without it only the numbers print.
+given, and for a file only one folder has), so it works in CI; it is 2 when there is nothing to compare (two folders
+with no image of the same name). Folder files are matched by full name, extension included (`a.png` is not `a.jpg`);
+when two compared files share a stem the outputs are named `<full name>.png`. Pixels that are fully transparent on both
+sides count as equal. `--out` is optional: without it only the numbers print.
 
 ### Find an atlas
 

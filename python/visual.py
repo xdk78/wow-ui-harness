@@ -12,6 +12,7 @@ import io
 import json
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont
@@ -29,8 +30,12 @@ PANEL_GAP = 8  # between the panels of a comparison
 PANEL_HEAD = 28  # the label row above them
 
 
-def die(message: str):
-    sys.exit(f"wowui: {message}")
+def die(message: str, code: int = 1):
+    """Stop with a message on stderr; exit code 1 (a failed check) or, for unusable input, `code`."""
+    if code == 1:
+        sys.exit(f"wowui: {message}")
+    print(f"wowui: {message}", file=sys.stderr)
+    sys.exit(code)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -69,13 +74,20 @@ def flatten(img: Image.Image, background=BAND) -> Image.Image:
     return Image.alpha_composite(Image.new("RGBA", rgba.size, (*background, 255)), rgba).convert("RGB")
 
 
-def load_flat(path: Path) -> Image.Image:
+def open_rgba(path: Path) -> Image.Image:
+    """The image as RGBA, whatever its mode (palette, LA, 16-bit grey, ...); the file is closed again."""
     try:
         with Image.open(path) as im:
             im.load()
-            return flatten(im)
+            if im.mode == "I" or im.mode.startswith("I;16"):
+                im = im.point(lambda v: v / 256, "L")  # 16-bit grey -> 8-bit, not clipped to white
+            return im.convert("RGBA")
     except OSError as e:
         die(f"cannot read image {path}: {e}")
+
+
+def load_flat(path: Path) -> Image.Image:
+    return flatten(open_rgba(path))
 
 
 def parse_box(text, what: str = "--crop"):
@@ -351,9 +363,10 @@ def build_gif(frames: list[dict], st: dict) -> tuple[bytes, dict]:
     budget = st["max_bytes"]
     widths = [w0]
     if budget:
-        floor = min(w0, st["min_width"] or 240)
+        floor = max(1, min(w0, st["min_width"] or 240))
         while widths[-1] > floor:
-            widths.append(max(floor, round(widths[-1] * 0.9)))
+            # Each step is strictly narrower, so a tiny floor cannot stall the ladder.
+            widths.append(max(floor, min(widths[-1] - 1, round(widths[-1] * 0.9))))
     ladder = [st["colors"]] + [c for c in (128, 64, 32, 16) if st["min_colors"] <= c < st["colors"]]
     smallest = None
     for width in widths:
@@ -478,10 +491,14 @@ def to_common_rgba(a: Image.Image, b: Image.Image) -> tuple[Image.Image, Image.I
 
 
 def changed_mask(a: Image.Image, b: Image.Image, tolerance: int = 0) -> tuple[Image.Image, int]:
-    """(mask, count): 255 where any channel differs by more than `tolerance`, and how many pixels that is."""
+    """(mask, count): 255 where any channel differs by more than `tolerance`, and how many pixels that is.
+
+    Pixels that are fully transparent in both images are equal, whatever colour they hide."""
     r, g, bl, al = ImageChops.difference(a, b).split()
     biggest = ImageChops.lighter(ImageChops.lighter(r, g), ImageChops.lighter(bl, al))
     mask = biggest.point([0] * (tolerance + 1) + [255] * (255 - tolerance))
+    visible = ImageChops.lighter(a.getchannel("A"), b.getchannel("A")).point([0] + [255] * 255)
+    mask = ImageChops.darker(mask, visible)
     return mask, mask.histogram()[255]
 
 
@@ -510,7 +527,7 @@ def compose_comparison(a, b, mask, labels: tuple[str, str], diff_label: str, zoo
 
 def compare_images(path_a: Path, path_b: Path, a) -> dict:
     """Compare two image files; the result has the counts, whether it differs and the composed image."""
-    ia, ib = Image.open(path_a), Image.open(path_b)
+    ia, ib = open_rgba(path_a), open_rgba(path_b)
     sizes = (ia.size, ib.size)
     ia, ib = to_common_rgba(ia, ib)
     if a.crop:
@@ -572,6 +589,15 @@ def cmd_compare(a):
     if not (pa.is_dir() and pb.is_dir()):
         die("compare: give two images or two folders")
     left, right = _images_in(pa), _images_in(pb)
+    if not set(left) & set(right):
+        # Nothing to compare is not "same": exit 2, so a wrong folder cannot pass a CI check.
+        die(
+            f"no image has the same name in both folders ({len(left)} in A, {len(right)} in B; "
+            "files are matched by full name, extension included)",
+            2,
+        )
+    stems = Counter(Path(k).stem for k in set(left) & set(right))
+    used: set[str] = set()
     different = 0
     for key in sorted(set(left) | set(right), key=natural_key):
         if key not in right or key not in left:
@@ -583,7 +609,12 @@ def cmd_compare(a):
         different += r["different"]
         if out:
             out.mkdir(parents=True, exist_ok=True)
-            r["image"].save(out / (left[key].stem + ".png"), optimize=True)
+            # a.png and a.jpg are two images: the second extension stays in the name so one cannot overwrite the other.
+            name = Path(key).stem if stems[Path(key).stem] == 1 else left[key].name
+            while f"{name}.png".lower() in used:
+                name += "_"
+            used.add(f"{name}.png".lower())
+            r["image"].save(out / f"{name}.png", optimize=True)
     names = len(set(left) | set(right))
     print(f"wowui: {different} of {names} images differ" + (f"; comparisons written to {out}" if out else ""))
     return 1 if different else 0

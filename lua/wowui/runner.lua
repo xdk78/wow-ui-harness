@@ -248,8 +248,10 @@ function Runner.Main(M, cfg, argv)
 	local all, written = {}, {}
 	local prefix = args.prefix or ""
 	-- A view's setup runs once. A view with `needs` (a step of wowui.views' Sequence) has the view it builds on set up
-	-- first when that one was not selected, so `--only` of a later step shows the same state as a full run.
-	local ran, sequences, started = {}, {}, {}
+	-- first when that one was not selected, so `--only` of a later step shows the same state as a full run. A step that
+	-- fails (its own or one it needs) stops the run with exit code 3 at once: no further views are dumped and no pending
+	-- teardown or sequence `finish` runs (the same as before sequences existed).
+	local ran = {}
 	local function setUp(view)
 		if ran[view] then
 			return true
@@ -258,10 +260,6 @@ function Runner.Main(M, cfg, argv)
 			return false
 		end
 		ran[view] = true
-		if view.sequence and not started[view.sequence] then
-			started[view.sequence] = true
-			sequences[#sequences + 1] = view.sequence
-		end
 		local ok, err = pcall(view.setup, ctx)
 		if not ok then
 			io.stderr:write(string.format("view %s: setup failed: %s\n", view.name, tostring(err)))
@@ -271,49 +269,62 @@ function Runner.Main(M, cfg, argv)
 		Layout.SettleSizes(M)
 		return true
 	end
+	local selected = {}
 	for _, view in ipairs(cfg.views or {}) do
 		if not args.only or args.only[view.name] then
-			if not setUp(view) then
-				return 3
-			end
-			local window = view.window
-			if type(window) == "function" then
-				window = window(ctx)
-			end
-			local name = prefix .. view.name
-			local meta = cfg.meta and cfg.meta(ctx, view) or nil
-			if view.meta then
-				meta = meta or {}
-				for k, v in pairs(view.meta) do
-					meta[k] = v
-				end
-			end
-			local doc = Dump.Capture(M, { view = name, window = window, meta = meta })
-			local path = args.out .. "/" .. fileName(name) .. ".json"
-			Dump.Write(doc, path)
-			written[#written + 1] = path
-			for _, f in ipairs(Lint.Run(doc)) do
-				local ignored = false
-				for _, pattern in ipairs(cfg.lintIgnore or {}) do
-					if f.key:find(pattern) then
-						ignored = true
-						break
-					end
-				end
-				if not ignored then
-					all[#all + 1] = f
-				end
-			end
-			if view.teardown then
-				view.teardown(ctx)
-			end
+			selected[#selected + 1] = view
 		end
 	end
-	-- A sequence whose last step was not part of the run still gets its finish.
-	for _, seq in ipairs(sequences) do
-		if not seq.done and seq.finish then
-			seq.done = true
-			seq.finish(ctx)
+	for index, view in ipairs(selected) do
+		if not setUp(view) then
+			return 3
+		end
+		local window = view.window
+		if type(window) == "function" then
+			window = window(ctx)
+		end
+		local name = prefix .. view.name
+		local meta = cfg.meta and cfg.meta(ctx, view) or nil
+		if view.meta then
+			meta = meta or {}
+			for k, v in pairs(view.meta) do
+				meta[k] = v
+			end
+		end
+		local doc = Dump.Capture(M, { view = name, window = window, meta = meta })
+		local path = args.out .. "/" .. fileName(name) .. ".json"
+		Dump.Write(doc, path)
+		written[#written + 1] = path
+		for _, f in ipairs(Lint.Run(doc)) do
+			local ignored = false
+			for _, pattern in ipairs(cfg.lintIgnore or {}) do
+				if f.key:find(pattern) then
+					ignored = true
+					break
+				end
+			end
+			if not ignored then
+				all[#all + 1] = f
+			end
+		end
+		if view.teardown then
+			view.teardown(ctx)
+		end
+		-- A sequence whose last step was not selected finishes after its last selected step, before the next selected
+		-- view, so that view sees the same state as in a full run.
+		local seq = view.sequence
+		if seq and not seq.done and seq.finish then
+			local later = false
+			for j = index + 1, #selected do
+				if selected[j].sequence == seq then
+					later = true
+					break
+				end
+			end
+			if not later then
+				seq.done = true
+				seq.finish(ctx)
+			end
 		end
 	end
 	local asked = {}

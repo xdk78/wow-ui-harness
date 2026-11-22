@@ -1148,6 +1148,72 @@ def test_gif_size_budget_reduces_colours_then_width_and_reports_failure():
         assert code == 1 and not nope.exists(), "a budget nothing fits is an error, and nothing is written"
 
 
+def test_gif_budget_ladder_ends_with_a_tiny_min_width():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        for i in range(2):
+            Image.new("RGB", (8, 8), (i * 100, 5, 5)).save(tmp / f"f{i}.png")
+        out = tmp / "o.gif"
+        # The ladder 8, 7, 6, ... 1 must end even though 90% of 4 rounds back to 4.
+        code, _ = _quiet(["gif", str(tmp / "f*.png"), "--out", str(out), "--min-width", "1", "--max-bytes", "10"])
+        assert code == 1 and not out.exists()
+
+
+def test_gif_auto_crop_of_an_all_background_frame_is_no_crop():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        _solid(tmp / "f0.png", size=(30, 20))
+        _solid(tmp / "f1.png", size=(30, 20))
+        out = tmp / "o.gif"
+        assert _quiet(["gif", str(tmp / "f*.png"), "--out", str(out), "--crop", "auto"])[0] == 0
+        assert _gif_frames(out)[0][0][0].size == (30, 20)
+
+
+def test_compare_ignores_hidden_colour_of_transparent_pixels_and_reads_other_modes():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        a, b = str(tmp / "a.png"), str(tmp / "b.png")
+        Image.new("RGBA", (4, 4), (0, 0, 0, 0)).save(a)
+        Image.new("RGBA", (4, 4), (200, 10, 10, 0)).save(b)
+        assert _quiet(["compare", a, b])[0] == 0, "fully transparent on both sides is the same"
+        Image.new("RGBA", (4, 4), (200, 10, 10, 1)).save(b)
+        assert _quiet(["compare", a, b])[0] == 1, "a visible difference in alpha still counts"
+        Image.new("I;16", (4, 4), 1000).save(a)
+        Image.new("I;16", (4, 4), 2000).save(b)
+        code, out = _quiet(["compare", a, b])
+        assert code == 1 and "16 of 16" in out, "16-bit grey is scaled, not clipped to white"
+        Image.new("P", (4, 4), 0).save(a)
+        Image.new("LA", (4, 4), (0, 255)).save(b)
+        assert _quiet(["compare", a, b])[0] == 0, "palette and grey-alpha images are normalised"
+
+
+def test_compare_folders_without_common_files_and_same_stem_outputs():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        for d in ("x", "y", "o1", "o2"):
+            (tmp / d).mkdir()
+        try:
+            _quiet(["compare", str(tmp / "x"), str(tmp / "y")])
+        except SystemExit as e:
+            assert e.code == 2, "empty folders are unusable input, not 'same'"
+        else:
+            raise AssertionError("empty folders must not pass")
+        _solid(tmp / "x" / "only.png")
+        try:
+            _quiet(["compare", str(tmp / "x"), str(tmp / "y")])
+        except SystemExit as e:
+            assert e.code == 2
+        else:
+            raise AssertionError("no file in common must not pass")
+        # a.png and a.jpg are two images: both outputs exist, under different names.
+        for d in ("o1", "o2"):
+            _solid(tmp / d / "a.png")
+            _solid(tmp / d / "a.jpg")
+        code, _ = _quiet(["compare", str(tmp / "o1"), str(tmp / "o2"), "--out", str(tmp / "out")])
+        assert code == 0
+        assert sorted(p.name for p in (tmp / "out").iterdir()) == ["a.jpg.png", "a.png.png"]
+
+
 def test_parse_size_and_box():
     assert visual.parse_size("3000") == 3000
     assert visual.parse_size("500KB") == 512000

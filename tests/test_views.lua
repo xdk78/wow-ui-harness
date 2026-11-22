@@ -124,6 +124,34 @@ T.case("views: --only a later step runs the steps before it first, and finish st
 	T.eq(finished, 1, "the unfinished sequence is finished at the end of the run")
 end)
 
+T.case("views: an unfinished sequence finishes before the next selected view, as in a full run", function()
+	local mock = T.fresh()
+	local Views = require("wowui.views")
+	local finished, finishedWhenPlainRan = 0, nil
+	local views = Views.Sequence("grow", { function() end, function() end, function() end }, {
+		finish = function() finished = finished + 1 end,
+	})
+	views[#views + 1] = { name = "plain", setup = function() finishedWhenPlainRan = finished end }
+	local docs = run(mock, views, { "--only", "seq-grow-02,plain" })
+	T.ok(docs["seq-grow-02"] and docs.plain, "both selected views are dumped")
+	T.eq(finishedWhenPlainRan, 1, "the sequence was finished before the plain view was set up")
+	T.eq(finished, 1, "and only once")
+	finished, finishedWhenPlainRan = 0, nil
+	run(mock, views)
+	T.eq(finishedWhenPlainRan, 1, "a full run does the same")
+	T.eq(finished, 1)
+end)
+
+local function runQuietly(mock, views, extraArgs)
+	local message = {}
+	local realErr = io.stderr
+	rawset(io, "stderr", { write = function(_, text) message[#message + 1] = text end })
+	local ok, docs, code = pcall(run, mock, views, extraArgs)
+	rawset(io, "stderr", realErr)
+	assert(ok, docs)
+	return docs, code, table.concat(message)
+end
+
 T.case("views: plain views and sequences mix, and a failing step stops the run", function()
 	local mock = T.fresh()
 	local Views = require("wowui.views")
@@ -131,11 +159,27 @@ T.case("views: plain views and sequences mix, and a failing step stops the run",
 	for _, v in ipairs(Views.Sequence("bad", { function() end, function() error("boom") end })) do
 		views[#views + 1] = v
 	end
-	local realErr = io.stderr
-	rawset(io, "stderr", { write = function() end })
-	local docs, code = run(mock, views)
-	rawset(io, "stderr", realErr)
+	local docs, code, message = runQuietly(mock, views)
 	T.eq(code, 3, "setup failure is exit code 3")
 	T.ok(docs.plain and docs["seq-bad-01"], "the views before the failure were dumped")
 	T.eq(docs["seq-bad-02"], nil)
+	T.ok(message:find("seq-bad-02", 1, true) and message:find("boom", 1, true), message)
+end)
+
+T.case("views: a failing step that --only pulls in is reported, exit 3, nothing after it runs", function()
+	local mock = T.fresh()
+	local Views = require("wowui.views")
+	local ran, finished = {}, 0
+	local views = Views.Sequence("bad", {
+		function() ran[#ran + 1] = 1; error("step one broke") end,
+		function() ran[#ran + 1] = 2 end,
+	}, { finish = function() finished = finished + 1 end })
+	views[#views + 1] = { name = "after", setup = function() ran[#ran + 1] = "after" end }
+	local docs, code, message = runQuietly(mock, views, { "--only", "seq-bad-02,after" })
+	T.eq(code, 3)
+	T.ok(message:find("seq-bad-01", 1, true) and message:find("step one broke", 1, true), message)
+	T.eq(table.concat(ran, ","), "1", "step 2 and the later view never ran")
+	T.eq(docs["seq-bad-02"], nil)
+	T.eq(docs.after, nil)
+	T.eq(finished, 0, "a failed run does not run pending finish callbacks")
 end)

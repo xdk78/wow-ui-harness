@@ -22,7 +22,8 @@
 -- last step, like a view's teardown) and `meta` (fields for every step).
 --
 -- With the runner's `--only seq-pick-tab-03`, the steps before it run first without being dumped (a view's `needs`), so
--- the state is the same as in a full run; `finish` runs at the end of the run when the last step was not part of it.
+-- the state is the same as in a full run; `finish` runs right after the last selected step of the sequence when the
+-- last step was not selected. A step that throws stops the run (exit code 3) without running `finish`.
 
 local Views = {}
 

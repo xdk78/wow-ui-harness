@@ -280,6 +280,21 @@ local function compute(r)
 	elseif r._h then
 		h = r._h * s
 	end
+	-- A texture given no size (or 0) whose file's size is known (mock.textureSizes, the runner's --sizes) takes the
+	-- file's pixel size, as the client does.
+	if r._type == "Texture" and r._texture ~= nil and not (L and R and T and B) then
+		local M = state.mock
+		local key = M.TextureKey and M.TextureKey(M.SyntheticPath and M.SyntheticPath(r._texture) or r._texture)
+		local size = key ~= nil and M.textureSizes and M.textureSizes[key]
+		if size then
+			if not (L and R) and (r._w or 0) == 0 then
+				w = size[1] * s
+			end
+			if not (T and B) and (r._h or 0) == 0 then
+				h = size[2] * s
+			end
+		end
+	end
 	if r._type == "FontString" and (w == nil or h == nil) then
 		local lay = Layout.TextLayout(r, w and (w / s) or nil, h and (h / s) or nil)
 		w = w or lay.width * s

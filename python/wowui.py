@@ -11,9 +11,10 @@ Subcommands (run with `uv run --script <harness>/python/wowui.py <command> ...`)
            (the dump's --font-root "Fonts\\=<dir>").
   atlases  --game <client folder> --out <file>
            Every atlas the client knows, one "name<TAB>width<TAB>height" per line (the dump's --atlases).
-  files    --game <client folder> --dump <dir> --out <file>
+  files    --game <client folder> --dump <dir> [--out <file>] [--sizes <json>] [--addon <Name>=<folder> ...]
            Which of the paths a dump asked GetFileIDFromPath about (or drew) the client has, "fileID<TAB>path" per
-           line (the dump's --files, for a second dump that answers like the client).
+           line (the dump's --files, for a second dump that answers like the client). --sizes writes facts an addon
+           can commit for CI (the dump's --sizes): those files' IDs and pixel sizes and the asked atlases' sizes.
   render   --dump <dir or .json> --out <dir> [--game <client folder>] [--addon <Name>=<folder> ...] [--root <dir>]
            [--scale 1] [--crop window|content|screen] [--lint]
            Draw every dump as a PNG: textures from the client's CASC storage (BLP decoded) or from addon folders,
@@ -905,35 +906,103 @@ def cmd_atlases(a):
     print(f"wowui: {len(lines)} atlases written to {a.out}")
 
 
+SIZES_SCHEMA = "wowui-sizes/1"
+
+
+def image_size(raw: bytes) -> tuple[int, int] | None:
+    """Width and height from an image file's header (BLP1/BLP2, TGA, PNG, JPEG...), without decoding its pixels."""
+    if raw[:4] in (b"BLP1", b"BLP2") and len(raw) >= 20:
+        return struct.unpack_from("<II", raw, 12)
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            return img.size
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def cmd_files(a):
-    """Which of the paths a dump run asked GetFileIDFromPath about (and drew) exist in the client: fileID<TAB>path."""
+    """Which of the paths a dump run asked GetFileIDFromPath about (and drew) exist in the client: fileID<TAB>path.
+    With --sizes, also a JSON of facts for CI: those files' IDs and pixel sizes and the asked atlases' sizes."""
+    if not a.out and not a.sizes:
+        print("wowui files: give --out, --sizes or both", file=sys.stderr)
+        return 2
     c = casc_mod.Casc(Path(a.game))
     dump = Path(a.dump)
-    paths = set()
+    paths, atlas_names = set(), set()
     for p in dump.glob("*files-asked.txt"):
         paths.update(x.strip() for x in p.read_text(encoding="utf-8").splitlines() if x.strip())
+    for p in dump.glob("*atlases-asked.txt"):
+        atlas_names.update(x.strip() for x in p.read_text(encoding="utf-8").splitlines() if x.strip())
     for p in _dumps(dump):
         doc = json.loads(p.read_text(encoding="utf-8"))
         for e in doc.get("regions", []):
+            tex = e.get("texture") or {}
             for f in (
-                (e.get("texture") or {}).get("file"),
+                tex.get("file"),
                 (e.get("backdrop") or {}).get("bgFile"),
                 (e.get("backdrop") or {}).get("edgeFile"),
+                (e.get("line") or {}).get("file"),
             ):
                 if isinstance(f, str) and f:
                     paths.add(f)
-    lines = []
+            for name in (tex.get("atlas"), (e.get("line") or {}).get("atlas")):
+                if isinstance(name, str) and name:
+                    atlas_names.add(name)
+    addons = {}
+    for spec in a.addon or []:
+        k, _, v = spec.partition("=")
+        addons[k] = Path(v)
+    game = Game(None, addons) if addons else None
+    lines, files = [], {}
     for path in sorted(paths):
         if path.lower().replace("/", "\\").startswith("interface\\addons\\"):
-            continue  # an addon's own files are not in the client's storage
+            # An addon's own files are not in the client's storage; their sizes come from --addon folders.
+            raw = game._addon_file(path) if game else None
+            size = image_size(raw) if raw else None
+            if size:
+                files[path.replace("/", "\\")] = {"size": list(size)}
+            continue
         p = path.replace("/", "\\")
         tries = [p] if "." in p.rsplit("\\", 1)[-1] else []
         tries += [p + ".blp", p + ".tga"]
-        fid = next((c.file_id(t) for t in tries if c.file_id(t) is not None), None)
-        if fid is not None:
-            lines.append(f"{fid}\t{path}")
-    Path(a.out).write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"wowui: {len(lines)} of {len(paths)} paths exist in the client; written to {a.out}")
+        hit = next((t for t in tries if c.file_id(t) is not None), None)
+        if hit is None:
+            continue
+        fid = c.file_id(hit)
+        lines.append(f"{fid}\t{path}")
+        entry = {"id": fid}
+        if a.sizes:
+            try:
+                raw = c.read(hit)
+            except Exception:  # noqa: BLE001
+                raw = None
+            size = image_size(raw) if raw else None  # None: streamed and not downloaded yet
+            if size:
+                entry["size"] = list(size)
+        files[p] = entry
+    if a.out:
+        Path(a.out).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"wowui: {len(lines)} of {len(paths)} paths exist in the client; written to {a.out}")
+    if a.sizes:
+        g = Game(None, {})
+        g.casc = c  # the storage opened above
+        known = g.atlases()
+        if atlas_names and not known:
+            print("wowui files: the client's atlas tables could not be read; no sizes file written", file=sys.stderr)
+            return 2
+        atlases = {}
+        for name in sorted(atlas_names):
+            v = known.get(name.lower())
+            if v:
+                atlases[name] = [v[7] or (v[2] - v[1]), v[8] or (v[4] - v[3])]
+        doc = {"schema": SIZES_SCHEMA, "files": files, "atlases": atlases}
+        Path(a.sizes).write_text(json.dumps(doc, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+        sized = sum(1 for v in files.values() if "size" in v)
+        print(
+            f"wowui: sizes of {sized} files and {len(atlases)} of {len(atlas_names)} atlases written to {a.sizes}"
+            + (f" ({len(files) - sized} files without a size: not downloaded)" if len(files) > sized else "")
+        )
+    return 0
 
 
 def cmd_render(a):
@@ -1010,7 +1079,9 @@ def main(argv=None):
     p = sub.add_parser("files", help="which files a dump asked for exist in the client")
     p.add_argument("--game", required=True)
     p.add_argument("--dump", required=True)
-    p.add_argument("--out", required=True)
+    p.add_argument("--out", help="fileID<TAB>path list for the dump's --files")
+    p.add_argument("--sizes", help="JSON of file IDs and pixel sizes and atlas sizes for the dump's --sizes")
+    p.add_argument("--addon", action="append", help="Name=folder: also record the sizes of an addon's own files")
     p.set_defaults(fn=cmd_files)
     p = sub.add_parser("render", help="draw dumps as PNG")
     p.add_argument("--dump", required=True)

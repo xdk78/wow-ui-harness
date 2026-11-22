@@ -21,6 +21,10 @@ Subcommands (run with `uv run --script <harness>/python/wowui.py <command> ...`)
            are labelled placeholders. --lint also writes <view>.lint.png with the lint findings marked.
   lint     --dump <dir> [--baseline <file>]
            Print the lint findings the dump run wrote (lint.json); with a baseline, exit 1 on findings not in it.
+  check    [--config <file>] [--root <addon folder>] [--format text|json] [paths ...]
+           Static safety check of an addon's Lua source (no game, no mock; check.py, standard library only): forbidden
+           calls, combat log registration, new globals, long files, shell-out tests, unguarded registrations. Exit 1
+           on findings, 2 on a config or usage error. Rules and config: README.md, "Static safety check".
 
 The game folder is only read. Keep --out outside any repository: renders contain game art.
 """
@@ -41,6 +45,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import casc as casc_mod  # noqa: E402
+import check as check_mod  # noqa: E402
 import db2  # noqa: E402
 
 __version__ = "0.2.0"
@@ -1023,6 +1028,9 @@ def main(argv=None):
     p.add_argument("--dump", required=True)
     p.add_argument("--baseline")
     p.set_defaults(fn=cmd_lint)
+    p = sub.add_parser("check", help="static safety check of an addon's Lua source")
+    check_mod.add_arguments(p)
+    p.set_defaults(fn=check_mod.run)
     a = ap.parse_args(argv)
     return a.fn(a) or 0
 

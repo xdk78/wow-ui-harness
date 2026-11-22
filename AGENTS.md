@@ -10,8 +10,9 @@ particular addon.
 - `lua/wowui/` the Lua package: `mock` (client API), `layout` (anchors, sizes, scales, text), `text` (markup and line
   layout), `ttf` (font metrics and character maps), `dump` (frame tree as JSON), `lint`, `runner` (command line),
   `json`.
-- `python/` `wowui.py` (PEP 723 script: `render`, `lint`, `fonts`, `atlases`, `files`), `casc.py` (CASC storage,
-  read-only), `db2.py` (WDC3-5 tables).
+- `python/` `wowui.py` (PEP 723 script: `render`, `lint`, `fonts`, `atlases`, `files`, `check`), `casc.py` (CASC
+  storage, read-only), `db2.py` (WDC3-5 tables), `check.py` (static safety lint of an addon's Lua; standard library
+  only, also runnable on its own).
 - `lib/LibUIShots-1.0/` the in-game library (LibStub; CallbackHandler-1.0 optional).
 - `examples/` a small addon with deliberate layout mistakes and its dump script; the tests use both.
 - `tests/` `run.lua` (Lua tests), `test_cli.py` (Python tests), `vendor/LibStub.lua`.

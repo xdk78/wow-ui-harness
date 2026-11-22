@@ -33,7 +33,7 @@ files["tests/"] = {
 	read_globals = {
 		"arg", "CreateFrame", "UIParent", "C_Timer", "GetFileIDFromPath", "C_Item", "GetItemInfoInstant", "MenuUtil",
 		"MenuResponse", "GetCursorPosition", "IsMouseButtonDown", "IsShiftKeyDown", "IsLeftShiftKeyDown",
-		"IsControlKeyDown", "IsAltKeyDown", "IsModifierKeyDown", "IsKeyDown",
+		"IsControlKeyDown", "IsAltKeyDown", "IsModifierKeyDown", "IsKeyDown", "C_Texture",
 	},
 }
 files["examples/"] = { read_globals = { "arg", "CreateFrame", "UIParent" } }

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -27,10 +28,11 @@ ADDON_PATH = f"Interface\\AddOns\\{ADDON}\\"
 TOC_NAMES = [
     ADDON + suffix + ".toc" for suffix in ("", "_Mainline", "_Vanilla", "_Classic", "_TBC", "_Wrath", "_Cata", "_Mists")
 ]
-CACHE_SCHEMA = "wowui-api-cache/1"
+CACHE_SCHEMA = "wowui-api-cache/2"  # raise it when the parser or the shape of the parsed tables changes
+MAX_DEPTH = 100  # table nesting the parser accepts (the documentation's own is under 10)
 
 EXIT_NOT_FOUND = 1
-EXIT_NO_DOCS = 2
+EXIT_NO_DOCS = 2  # also usage errors and a cache path that is refused
 EXIT_AMBIGUOUS = 3
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -72,7 +74,7 @@ def _quoted(src: str, i: int) -> tuple[str, int]:
     out = bytearray()
     while True:
         c = src[i : i + 1]
-        if c == "" or c == "\n":
+        if c in ("", "\n", "\r"):
             raise LuaError(f"line {_line_of(src, start)}: unfinished string")
         if c == quote:
             return out.decode("utf-8", "replace"), i + 1
@@ -84,9 +86,11 @@ def _quoted(src: str, i: int) -> tuple[str, int]:
         if e in _ESCAPES:
             out += _ESCAPES[e].encode()
             i += 2
-        elif e == "\n":
+        elif e in ("\n", "\r"):  # a backslash before a line break: a newline (CRLF and LFCR count as one break)
             out += b"\n"
             i += 2
+            if src[i : i + 1] in ("\n", "\r") and src[i : i + 1] != e:
+                i += 1
         elif e == "x":
             out.append(int(src[i + 2 : i + 4], 16))
             i += 4
@@ -101,9 +105,9 @@ def _quoted(src: str, i: int) -> tuple[str, int]:
             raise LuaError(f"line {_line_of(src, i)}: bad escape \\{e}")
 
 
-def tokenize(src: str) -> list[tuple[str, object, int]]:
-    """(kind, value, position) for each token: kind is "str", "num", "name" or "op"; comments and blanks are dropped."""
-    toks: list[tuple[str, object, int]] = []
+def tokenize(src: str) -> list[tuple[str, object, int, int]]:
+    """(kind, value, start, end) per token: kind is "str", "num", "name" or "op"; comments and blanks are dropped."""
+    toks: list[tuple[str, object, int, int]] = []
     i, n = 0, len(src)
     while i < n:
         c = src[i]
@@ -118,11 +122,11 @@ def tokenize(src: str) -> list[tuple[str, object, int]]:
                 i = n if j < 0 else j
         elif c in "\"'":
             s, j = _quoted(src, i)
-            toks.append(("str", s, i))
+            toks.append(("str", s, i, j))
             i = j
         elif c == "[" and (m := _LONG_OPEN.match(src, i)):
             s, j = _long_bracket(src, i, m, "long string")
-            toks.append(("str", s, i))
+            toks.append(("str", s, i, j))
             i = j
         elif m := _NUMBER.match(src, i):
             text = m.group()
@@ -132,14 +136,14 @@ def tokenize(src: str) -> list[tuple[str, object, int]]:
                 value = int(text)
             else:
                 value = float(text)
-            toks.append(("num", value, i))
+            toks.append(("num", value, i, m.end()))
             i = m.end()
         elif m := _NAME.match(src, i):
-            toks.append(("name", m.group(), i))
+            toks.append(("name", m.group(), i, m.end()))
             i = m.end()
         else:
             op = next((o for o in _OPERATORS if src.startswith(o, i)), c)
-            toks.append(("op", op, i))
+            toks.append(("op", op, i, i + len(op)))
             i += len(op)
     return toks
 
@@ -150,10 +154,11 @@ class _Parser:
         self.toks = tokenize(src)
         self.i = 0
         self.variables: dict[str, object] = {}
+        self.depth = 0
 
-    def peek(self, k: int = 0) -> tuple[str, object, int]:
+    def peek(self, k: int = 0) -> tuple[str, object, int, int]:
         j = self.i + k
-        return self.toks[j] if j < len(self.toks) else ("eof", "", len(self.src))
+        return self.toks[j] if j < len(self.toks) else ("eof", "", len(self.src), len(self.src))
 
     def is_op(self, value: str, k: int = 0) -> bool:
         t = self.peek(k)
@@ -170,7 +175,7 @@ class _Parser:
     def value(self):
         """A literal, a table, or an earlier variable; any other expression is kept as {"expr": <its source text>}."""
         start = self.i
-        kind, v, _ = self.peek()
+        kind, v = self.peek()[:2]
         if kind in ("str", "num"):
             self.i += 1
             result = v
@@ -194,9 +199,12 @@ class _Parser:
         return result
 
     def expression(self):
-        """Skip an expression the parser does not evaluate (Enum.X.Y, a + 1, f(x)) up to its end; keep its text."""
-        start, depth = self.i, 0
-        first = self.peek()[2]
+        """Skip an expression the parser does not evaluate (Enum.X.Y, a + 1, f(x)) up to its end; keep its text.
+
+        It ends at a ',' or ';', at a closing bracket that is not its own, or where an operand follows an operand (the
+        next statement: `local X = Foo` newline `local Y`); a call written without parentheses (`f "x"`) ends it early.
+        """
+        start, depth, after_operand = self.i, 0, False
         while (t := self.peek())[0] != "eof":
             if t[0] == "op":
                 if t[1] in ("(", "[", "{"):
@@ -207,18 +215,25 @@ class _Parser:
                     depth -= 1
                 elif t[1] in (",", ";") and depth == 0:
                     break
+            operand = t[0] in ("str", "num") or (t[0] == "name" and t[1] not in ("and", "or", "not"))
+            if depth == 0 and operand and after_operand:
+                break
+            after_operand = operand or (t[0] == "op" and t[1] in (")", "]", "}"))
             self.i += 1
         if self.i == start:
             self.fail("expected a value")
-        return {"expr": self.src[first : self.peek()[2]].strip()}
+        return {"expr": self.src[self.toks[start][2] : self.toks[self.i - 1][3]]}
 
     def table(self):
         """A table constructor: a list when it has only positional entries, else a dict (positional ones keyed 1..n)."""
+        if self.depth >= MAX_DEPTH:
+            self.fail(f"tables nested deeper than {MAX_DEPTH}")
+        self.depth += 1
         self.expect("{")
         positional: list = []
         keyed: dict = {}
         while not self.is_op("}"):
-            kind, v, _ = self.peek()
+            kind, v = self.peek()[:2]
             if kind == "eof":
                 self.fail("unfinished table")
             if self.is_op("["):
@@ -226,7 +241,11 @@ class _Parser:
                 key = self.value()
                 self.expect("]")
                 self.expect("=")
-                keyed[key] = self.value()
+                item = self.value()
+                if isinstance(key, dict) and set(key) == {"expr"}:
+                    keyed[key["expr"]] = item  # [Enum.X] = 1: keyed by the expression's text
+                elif not isinstance(key, (dict, list)):
+                    keyed[key] = item  # a table as a key cannot be a Python key: the entry is dropped
             elif kind == "name" and self.is_op("=", 1):
                 self.i += 2
                 keyed[v] = self.value()
@@ -237,6 +256,7 @@ class _Parser:
             elif not self.is_op("}"):
                 self.fail("expected ',' or '}'")
         self.i += 1
+        self.depth -= 1
         if not keyed:
             return positional
         for n, item in enumerate(positional, 1):
@@ -262,10 +282,10 @@ def parse_documentation(src: str) -> list[dict]:
     p = _Parser(src)
     out: list[dict] = []
     while p.peek()[0] != "eof":
-        kind, v, _ = p.peek()
+        kind, v = p.peek()[:2]
         if kind == "name" and v == "local" and p.peek(1)[0] == "name" and p.is_op("=", 2):
             p.i += 1
-            kind, v, _ = p.peek()
+            kind, v = p.peek()[:2]
         if kind == "name" and p.is_op("=", 1):
             p.i += 2
             p.variables[v] = p.value()
@@ -290,11 +310,20 @@ def parse_documentation(src: str) -> list[dict]:
 # Sources: a client's CASC storage, or a folder of the Lua files
 
 
+class SourceError(Exception):
+    """The documentation cannot be read at all (or the cache path is refused); the message says why. Exit code 2."""
+
+
 @dataclass
 class Source:
     docs: list[dict]  # the documentation tables, file by file
     signature: str  # changes when the files may have (the cache key)
     warnings: list[str]
+
+    @property
+    def complete(self) -> bool:
+        """Something was found and nothing was skipped: the only read worth caching."""
+        return bool(self.docs) and not self.warnings
 
 
 def _parse_files(files: list[tuple[str, str]]) -> tuple[list[dict], list[str]]:
@@ -322,9 +351,19 @@ def read_folder(folder: Path) -> Source | None:
     if base is None:
         return None
     paths = sorted(base.glob("*.lua"), key=lambda p: p.name.lower())
-    stamp = hashlib.sha1("\n".join(f"{p.name}:{p.stat().st_size}:{p.stat().st_mtime_ns}" for p in paths).encode())
-    docs, warnings = _parse_files([(p.name, p.read_text(encoding="utf-8", errors="replace")) for p in paths])
-    return Source(docs, "folder:" + stamp.hexdigest(), warnings)
+    files: list[tuple[str, str]] = []
+    unreadable: list[str] = []
+    stamp = []
+    for p in paths:
+        try:
+            files.append((p.name, p.read_text(encoding="utf-8", errors="replace")))
+            stamp.append(f"{p.name}:{p.stat().st_size}:{p.stat().st_mtime_ns}")
+        except OSError as e:
+            unreadable.append(f"{p.name} ({e})")
+    docs, warnings = _parse_files(files)
+    if unreadable:
+        warnings.append("unreadable files: " + ", ".join(unreadable[:5]))
+    return Source(docs, "folder:" + hashlib.sha1("\n".join(stamp).encode()).hexdigest(), warnings)
 
 
 def _build_info(game: Path) -> Path | None:
@@ -342,55 +381,106 @@ def game_signature(game: Path) -> str:
 
 
 def read_game(game: Path) -> Source | None:
-    """The documentation tables of a client's CASC storage, or None when its build has no such addon."""
+    """The documentation tables of a client's CASC storage, or None when its build has no such addon.
+
+    Raises SourceError when the storage cannot be opened; a file that cannot be read is a warning.
+    """
     import casc
 
-    c = casc.Casc(game)
-    toc = next((raw for name in TOC_NAMES if (raw := c.read(ADDON_PATH + name))), None)
-    if toc is None:
+    try:
+        c = casc.Casc(game)
+    except Exception as e:  # noqa: BLE001
+        raise SourceError(f"cannot read the client's CASC storage at {game}: {e}") from e
+    toc = None
+    for name in TOC_NAMES:
+        try:
+            toc = c.read(ADDON_PATH + name)
+        except Exception as e:  # noqa: BLE001
+            raise SourceError(f"cannot read {name} from the client's CASC storage: {e}") from e
+        if toc:
+            break
+    if not toc:
         return None
     names = []
     for line in toc.decode("utf-8", "replace").splitlines():
         line = line.strip()
-        if line and not line.startswith("#"):
+        if line and not line.startswith("#") and line.split()[0].lower().endswith(".lua"):
             names.append(line.split()[0].replace("/", "\\"))
     files: list[tuple[str, str]] = []
     missing: list[str] = []
+    unreadable: list[str] = []
     for name in sorted(names, key=str.lower):
-        raw = c.read(ADDON_PATH + name) if name.lower().endswith(".lua") else None
-        if raw is None:
-            if name.lower().endswith(".lua"):
-                missing.append(name)
+        try:
+            raw = c.read(ADDON_PATH + name)
+        except Exception as e:  # noqa: BLE001
+            unreadable.append(f"{name} ({e})")
             continue
-        files.append((name, raw.decode("utf-8", "replace")))
+        if raw is None:
+            missing.append(name)
+        else:
+            files.append((name, raw.decode("utf-8", "replace")))
     docs, warnings = _parse_files(files)
     if missing:
         warnings.append(
             f"{len(missing)} listed files are not in this install (not downloaded): " + ", ".join(missing[:5])
         )
+    if unreadable:
+        warnings.append(f"{len(unreadable)} files could not be read: " + ", ".join(unreadable[:5]))
     return Source(docs, game_signature(game), warnings)
 
 
+def _check_cache_path(game: Path, cache: Path) -> None:
+    """The game folder is only read: a cache file in it, or beside the .build.info above it, is refused."""
+    info = _build_info(game)
+    target = cache.resolve()
+    for folder in (game, info.parent if info else game):
+        if target.is_relative_to(folder.resolve()):
+            raise SourceError(
+                f"--cache {cache} is inside the game folder {folder}, which is only read: pick another path"
+            )
+
+
+def _read_cache(cache: Path, sig: str) -> Source | None:
+    try:
+        data = json.loads(cache.read_text(encoding="utf-8"))
+        if data["schema"] == CACHE_SCHEMA and data["signature"] == sig and isinstance(data["docs"], list):
+            return Source(data["docs"], sig, [])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass  # missing or damaged: rebuilt
+    return None
+
+
+def _write_cache(cache: Path, sig: str, docs: list[dict]) -> str | None:
+    """Write the cache through a temporary file; the problem as text, or None."""
+    tmp = cache.with_name(cache.name + ".tmp")
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps({"schema": CACHE_SCHEMA, "signature": sig, "docs": docs}), encoding="utf-8")
+        os.replace(tmp, cache)
+    except OSError as e:
+        return f"cache {cache} not written: {e}"
+    return None
+
+
 def load(game: Path | None, folder: Path | None, cache: Path | None) -> Source | None:
-    """The documentation tables from `folder` (copies of the files) or `game`; `cache` (JSON) saves re-reading it."""
+    """The documentation tables from `folder` (copies of the files) or `game`; `cache` (JSON) saves re-reading it.
+
+    The cache is written only for a complete read (no warnings, something found), so a partial install is not frozen
+    into it, and never inside the game folder.
+    """
     if folder is not None:
         return read_folder(folder)
     assert game is not None
     sig = game_signature(game)
-    if cache and sig and cache.exists():
-        try:
-            data = json.loads(cache.read_text(encoding="utf-8"))
-            if data.get("schema") == CACHE_SCHEMA and data.get("signature") == sig:
-                return Source(data["docs"], sig, data.get("warnings", []))
-        except (OSError, ValueError):
-            pass  # a damaged cache is rebuilt
+    if cache is not None:
+        _check_cache_path(game, cache)
+        if sig and (src := _read_cache(cache, sig)):
+            return src
     src = read_game(game)
-    if src is not None and cache and sig:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_text(
-            json.dumps({"schema": CACHE_SCHEMA, "signature": sig, "warnings": src.warnings, "docs": src.docs}),
-            encoding="utf-8",
-        )
+    if src is not None and cache is not None and sig and src.complete:
+        problem = _write_cache(cache, sig, src.docs)
+        if problem:
+            src.warnings.append(problem)
     return src
 
 
@@ -421,22 +511,25 @@ def build_index(docs: list[dict]) -> list[Entry]:
         system = str(d.get("Name") or "")
         is_object = d.get("Type") == "ScriptObject"
         group = system if is_object else str(d.get("Namespace") or "")
-        for f in d.get("Functions") or []:
+        for f in _params(d.get("Functions")):
             short = str(f.get("Name") or "")
             own = str(f["Namespace"]) if "Namespace" in f else group  # a function may name its own namespace
             if is_object:
                 out.append(Entry("method", f"{own}:{short}", short, own, system, f))
             else:
                 out.append(Entry("function", f"{own}.{short}" if own else short, short, own, system, f))
-        for e in d.get("Events") or []:
+        for e in _params(d.get("Events")):
             short = str(e.get("Name") or "")
             out.append(Entry("event", str(e.get("LiteralName") or short), short, group, system, e))
-        for t in d.get("Tables") or []:
+        for t in _params(d.get("Tables")):
             short = str(t.get("Name") or "")
             kind = TABLE_KINDS.get(str(t.get("Type")), str(t.get("Type") or "table").lower())
             prefix = {"enum": "Enum.", "constants": "Constants."}.get(kind, "")
             out.append(Entry(kind, prefix + short, short, group, system, t))
-    return sorted(out, key=lambda e: e.key)
+    unique: dict[tuple, Entry] = {}
+    for e in out:  # the same entry in two files (identical tables) counts once
+        unique.setdefault((e.kind, e.name, json.dumps(e.raw, sort_keys=True, default=str)), e)
+    return sorted(unique.values(), key=lambda e: e.key)
 
 
 def groups_of(index: list[Entry]) -> dict[str, list[Entry]]:
@@ -657,16 +750,27 @@ def _brief(e: Entry) -> dict:
 
 def run(a) -> int:
     """The `api` subcommand (a: the parsed command line, see add_arguments). Exit code: 0 found, 1 nothing found,
-    2 no documentation to read, 3 the name fits several entries."""
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
+    2 usage error, no documentation to read or a refused --cache path, 3 the name fits several entries."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     if a.docs is None and a.game is None:
         print("wowui: api needs --game <client folder> or --docs <folder of the documentation files>", file=sys.stderr)
         return EXIT_NO_DOCS
     if a.name is None and a.search is None:
         print("wowui: api needs a name to look up, or --search <text>", file=sys.stderr)
-        return EXIT_NOT_FOUND
-    src = load(Path(a.game) if a.game else None, Path(a.docs) if a.docs else None, Path(a.cache) if a.cache else None)
+        return EXIT_NO_DOCS
+    if a.docs is not None and a.cache is not None:
+        print("wowui: --cache applies to --game only; ignored with --docs", file=sys.stderr)
+    try:
+        src = load(
+            Path(a.game) if a.game else None, Path(a.docs) if a.docs else None, Path(a.cache) if a.cache else None
+        )
+    except SourceError as e:
+        print(f"wowui: {e}", file=sys.stderr)
+        return EXIT_NO_DOCS
+    for w in src.warnings if src else []:
+        print(f"wowui: warning: {w}", file=sys.stderr)
     if src is None or not src.docs:
         where = f"in {a.docs}" if a.docs else f"in the client at {a.game}"
         print(
@@ -675,8 +779,6 @@ def run(a) -> int:
             file=sys.stderr,
         )
         return EXIT_NO_DOCS
-    for w in src.warnings:
-        print(f"wowui: warning: {w}", file=sys.stderr)
     index = build_index(src.docs)
 
     if a.search is not None:

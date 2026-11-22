@@ -1546,12 +1546,26 @@ def test_lua_literal_parser():
         3: {"expr": "f(1, 2)"},
         "x": {"expr": "Constants.Y - 1"},
     }
-    for bad in ("{ 1, 2", '{ "unfinished }', "{ a = }", "{ 1 2 }"):
+    # The expression's text ends with its last token: a trailing comment is not part of it.
+    assert parse("{ x = Enum.A.B -- note\n, y = 1 }") == {"x": {"expr": "Enum.A.B"}, "y": 1}
+    # A backslash before a line break is a newline in a string, CRLF and LFCR included.
+    assert parse('{ "a\\\r\nb", "c\\\n\rd", "e\\\nf" }') == ["a\nb", "c\nd", "e\nf"]
+    # Mixed positional and keyed entries (positional ones are numbered from 1), ';' as separator, trailing ';'.
+    assert parse("{ 1, a = 2, 3; }") == {"a": 2, 1: 1, 2: 3}
+    assert parse("{ 1; 2; }") == [1, 2]
+    # A key that is not a plain value: an expression is keyed by its text; a table as key drops the entry.
+    assert parse("{ [Enum.X] = 1, [{}] = 2, [{ 1 }] = 3, ok = 4 }") == {"Enum.X": 1, "ok": 4}
+    # Nesting is limited (the file is skipped with a message, no RecursionError).
+    nested, levels = parse("{" * 50 + "}" * 50), 0
+    while nested:
+        nested, levels = nested[0], levels + 1
+    assert levels == 49
+    for bad in ("{ 1, 2", '{ "unfinished }', "{ a = }", "{ 1 2 }", "{" * 5000, "{ [Enum.X] = }"):
         try:
             parse(bad)
         except apidoc.LuaError:
             continue
-        raise AssertionError(f"{bad!r} parsed")
+        raise AssertionError(f"{bad[:20]!r} parsed")
 
 
 def test_parse_documentation_file():
@@ -1561,16 +1575,24 @@ def test_parse_documentation_file():
     assert docs[0]["Tables"][2]["Values"][1]["Value"] == {"expr": "Enum.UIMapType.Cosmic"}
     # Nothing is executed: a call that is not AddDocumentationTable is skipped, not run.
     assert apidoc.parse_documentation('error("boom")\nlocal x = 1\n') == []
+    # An expression the parser keeps as text ends at the next statement (`local X = Foo` does not swallow the rest).
+    tail = "local Y = { Name = 'a' }\nAPIDocumentation:AddDocumentationTable(Y)\n"
+    assert apidoc.parse_documentation("local X = Foo.Bar\n" + tail) == [{"Name": "a"}]
+    assert apidoc.parse_documentation("local X = f(1, 2)\nlocal Z = 1 + 2\n" + tail) == [{"Name": "a"}]
 
 
-def _api(docs_dir: Path, *args: str) -> tuple[int, str, str]:
+def _cli(*argv) -> tuple[int, str, str]:
     import contextlib
     import io
 
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-        code = wowui.main(["api", "--docs", str(docs_dir), *args])
+        code = wowui.main([str(a) for a in argv])
     return code, out.getvalue(), err.getvalue()
+
+
+def _api(docs_dir: Path, *args: str) -> tuple[int, str, str]:
+    return _cli("api", "--docs", docs_dir, *args)
 
 
 def test_api_lookups():
@@ -1685,24 +1707,97 @@ def test_api_json():
         assert [e["name"] for e in json.loads(out)] == ["Enum.UIMapType"]
 
 
-def test_api_cache_is_used_for_the_same_client():
-    import contextlib
-    import io
+def _fake_game(root: Path) -> Path:
+    """A folder with a .build.info above it and no CASC storage: enough for the cache rules, not for reading."""
+    game = root / "client" / "_retail_"
+    game.mkdir(parents=True)
+    (root / "client" / ".build.info").write_text("Branch!STRING:0\nus\n", encoding="utf-8")
+    return game
+
+
+def test_api_cache():
     import json
 
     with tempfile.TemporaryDirectory() as tmp:
-        game = Path(tmp) / "_retail_"
-        game.mkdir()
-        (Path(tmp) / ".build.info").write_text("Branch!STRING:0\nus\n", encoding="utf-8")
-        cache = Path(tmp) / "cache" / "api.json"
-        cache.parent.mkdir()
+        root = Path(tmp)
+        game = _fake_game(root)
+        cache = root / "cache" / "api.json"
         docs = apidoc.parse_documentation(MAP_DOC)
         sig = apidoc.game_signature(game)
-        cache.write_text(json.dumps({"schema": apidoc.CACHE_SCHEMA, "signature": sig, "docs": docs}), encoding="utf-8")
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            code = wowui.main(["api", "C_Map.GetBountySetMaps", "--game", str(game), "--cache", str(cache)])
-        assert code == 0 and out.getvalue().startswith("C_Map.GetBountySetMaps(")
+        ask = ("api", "C_Map.GetBountySetMaps", "--game", game, "--cache", cache)
+
+        # Written through a temporary file, and used again for the same client without reading its storage.
+        assert apidoc._write_cache(cache, sig, docs) is None
+        assert [p.name for p in cache.parent.iterdir()] == ["api.json"]
+        code, out, _ = _cli(*ask)
+        assert code == 0 and out.startswith("C_Map.GetBountySetMaps(")
+
+        # A cache for another client, an old format, a corrupt file or one of the wrong shape is not used: the client's
+        # storage is read instead (the fake one cannot be, which says so with exit code 2 and no traceback).
+        for stale in (
+            lambda: apidoc._write_cache(cache, "game:another", docs),
+            lambda: cache.write_text(
+                json.dumps({"schema": "wowui-api-cache/0", "signature": sig, "docs": []}), "utf-8"
+            ),
+            lambda: cache.write_text("{ not json", "utf-8"),
+            lambda: cache.write_text("[1, 2]", "utf-8"),
+            lambda: cache.write_text(json.dumps({"schema": apidoc.CACHE_SCHEMA}), "utf-8"),
+        ):
+            stale()
+            assert apidoc._read_cache(cache, sig) is None
+            code, _, err = _cli(*ask)
+            assert code == 2 and "CASC storage" in err and "Traceback" not in err, err
+
+        # A cache that cannot be written is a message, not a crash.
+        blocker = root / "blocker"
+        blocker.write_text("a file where a folder is needed", encoding="utf-8")
+        assert "not written" in apidoc._write_cache(blocker / "api.json", sig, docs)
+
+        # No .build.info, no storage: exit code 2 with the reason.
+        code, _, err = _cli("api", "C_Map", "--game", root / "nothing")
+        assert code == 2 and "CASC storage" in err
+
+        # The game folder is only read: a cache in it, or beside the .build.info above it, is refused.
+        for inside in (game / "api.json", game.parent / "api.json", game / "sub" / "api.json"):
+            code, _, err = _cli("api", "C_Map", "--game", game, "--cache", inside)
+            assert code == 2 and "only read" in err, err
+            assert not inside.exists()
+        assert not (game / "sub").exists(), "nothing is created in the game folder"
+
+        # A complete read is what the cache keeps: nothing found, or a warning, is not frozen into it.
+        assert not apidoc.Source([], sig, []).complete
+        assert not apidoc.Source(docs, sig, ["3 listed files are not in this install"]).complete
+        assert apidoc.Source(docs, sig, []).complete
+
+
+def test_api_usage_errors():
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        (d / "MapDocumentation.lua").write_text(MAP_DOC, encoding="utf-8")
+        code, _, err = _cli("api", "--docs", d)
+        assert code == 2 and "needs a name" in err
+        code, _, err = _cli("api", "C_Map")
+        assert code == 2 and "--game" in err and "--docs" in err
+        code, _, err = _cli("api", "C_Map", "--docs", d, "--cache", d / "x" / "cache.json")
+        assert code == 0 and "--cache applies to --game only" in err and not (d / "x").exists()
+
+
+def test_api_same_entry_in_two_files_is_not_ambiguous():
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        (d / "MapDocumentation.lua").write_text(MAP_DOC, encoding="utf-8")
+        (d / "CommentatorDocumentation.lua").write_text(COMMENTATOR_DOC, encoding="utf-8")
+        (d / "CommentatorAgainDocumentation.lua").write_text(COMMENTATOR_DOC, encoding="utf-8")
+        code, out, _ = _api(d, "GetMapInfo")
+        assert code == 3 and out.count("C_Commentator.GetMapInfo") == 1 and out.count("C_Map.GetMapInfo") == 1
+        code, out, _ = _api(d, "C_Commentator.GetMapInfo")
+        assert code == 0
+        # The same name with a different definition stays ambiguous.
+        (d / "CommentatorAgainDocumentation.lua").write_text(
+            COMMENTATOR_DOC.replace("teamSize", "size"), encoding="utf-8"
+        )
+        code, out, _ = _api(d, "C_Commentator.GetMapInfo")
+        assert code == 3 and out.count("\n  function ") == 2
 
 
 def test_api_without_documentation():
@@ -1719,6 +1814,12 @@ def test_api_without_documentation():
         (addon / "BrokenDocumentation.lua").write_text("local X = { Name = ", encoding="utf-8")
         code, _, err = _api(empty, "C_Map.GetMapInfo")
         assert code == 0 and "BrokenDocumentation.lua" in err
+        # Table keys that are not plain values and absurd nesting cost that file only, never the run.
+        (addon / "KeysDocumentation.lua").write_text("local X = { [Enum.A] = 1, [{}] = 2 }\n", encoding="utf-8")
+        (addon / "DeepDocumentation.lua").write_text("local X = " + "{" * 5000, encoding="utf-8")
+        code, _, err = _api(empty, "C_Map.GetMapInfo")
+        assert code == 0 and "DeepDocumentation.lua" in err and "deeper than" in err and "Traceback" not in err
+        assert "KeysDocumentation.lua" not in err
 
 
 def main():

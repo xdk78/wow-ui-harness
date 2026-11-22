@@ -455,15 +455,17 @@ $W C_Item.GetItemInfoInstant --json   # the documentation entry as JSON (camelCa
 - Functions, script-object methods (`SimpleFrameAPI:SetAlpha`), events, enumerations (`Enum.X`), structures, callback
   types and constants tables (`Constants.X`) are indexed. The docs' own flags (`MayReturnNothing`, `SecretArguments`...)
   print on the second line; a value the docs compute (`Enum.X.Y`, `a + 1`) prints as its source text.
-- Exit codes: 0 found, 1 nothing found, 2 no documentation to read, 3 the name fits several entries (they are listed).
+- Exit codes: 0 found, 1 nothing found, 2 usage error, no documentation to read (or storage that cannot be opened) or a
+  refused `--cache` path, 3 the name fits several entries (they are listed; an entry defined twice identically counts once).
 - The tables are Lua table constructors. They are parsed, never run (`python/apidoc.py`), so Python is all it needs.
   A file that does not parse is reported on stderr and skipped.
 - A client that does not ship the addon (older flavours) exits with code 2 and says so. `--docs <folder>` reads a copy
   of the documentation `.lua` files instead (for example the addon's folder from a checkout of
   [wow-ui-source](https://github.com/Gethe/wow-ui-source), or the folder that holds `Interface/AddOns`); it needs no
   client, so it also works in CI.
-- `--cache <file>` keeps the parsed documentation as JSON (keep it outside the game folder), keyed to the client's
-  `.build.info` (a patch changes it, and the cache is rebuilt), so repeated lookups skip reading CASC (about 2.5 s).
+- `--cache <file>` keeps the parsed documentation as JSON, keyed to the client's `.build.info` (a patch changes it, and
+  the cache is rebuilt), so repeated lookups skip reading CASC (about 2.5 s). A path inside the game folder is refused.
+  It is written only after a complete read (no skipped files), and only used with `--game`.
 - The documentation lists what the client's C API takes and returns. Lua-side code (for example `MenuUtil`) is not in
   it: look at the client's own addon files for that.
 

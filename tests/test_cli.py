@@ -11,6 +11,7 @@ Needs `lua` (5.1) on PATH: it dumps the example addon first, then renders and li
 
 from __future__ import annotations
 
+import io
 import shutil
 import struct
 import subprocess
@@ -73,6 +74,18 @@ def test_texcoords_flip_and_crop():
     assert out.size == (2, 2)
     flipped = wowui._crop_coords(img, [0.5, 0, 0, 1])
     assert flipped.getpixel((1, 0)) == (255, 0, 0, 255)
+
+
+def test_image_size_from_headers():
+    blp = b"BLP2" + struct.pack("<I", 1) + bytes([2, 8, 7, 1]) + struct.pack("<II", 256, 128) + bytes(64)
+    assert wowui.image_size(blp) == (256, 128), "BLP2 header"
+    buf = io.BytesIO()
+    Image.new("RGBA", (24, 12)).save(buf, "PNG")
+    assert wowui.image_size(buf.getvalue()) == (24, 12)
+    buf = io.BytesIO()
+    Image.new("RGBA", (5, 7)).save(buf, "TGA")
+    assert wowui.image_size(buf.getvalue()) == (5, 7)
+    assert wowui.image_size(b"not an image") is None
 
 
 def test_nine_slice_atlas_keeps_corners():

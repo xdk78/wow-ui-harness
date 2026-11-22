@@ -26,6 +26,12 @@
   `.wowui-check.json` in the addon repository. Rules: `forbidden-call`, `combat-log`, `new-global`, `file-length`,
   `test-shell-find`, `unguarded-registration`, `suppression-reason`; `-- wowui-check: ignore <rule> <reason>`
   suppressions; text or JSON output; exit code 1 on findings, 2 on a config error.
+- Layout parity in CI: `wowui.py files --sizes <json>` records the file IDs and pixel sizes of the game files a dump
+  asked for or drew (and of an addon's own files with `--addon`) and the sizes of the atlases it asked for
+  (`wowui-sizes/1`, sizes only, no pixels); the runner's `--sizes` (or the config's `sizes`) answers
+  `GetFileIDFromPath` and `C_Texture.GetAtlasInfo` from it, and with `wowui.layout` a texture with no size takes its
+  file's recorded size, as the client does. Runs write `atlases-asked.txt`; `mock.SetTextureSize`;
+  `GetFileIDFromPath` no longer minds the kind of slash.
 
 ## [0.2.0] - 2026-11-16
 

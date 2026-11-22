@@ -28,6 +28,21 @@ M.realm = "Realm"
 M.loadableAddons = {} -- [name] = true: C_AddOns.IsAddOnLoadable says yes
 M.atlases = {} -- [name] = true or { width, height }: C_Texture.GetAtlasInfo knows it
 M.files = {} -- [lower-case path] = file ID: GetFileIDFromPath knows it
+-- Pixel sizes of texture files: [path] or [file ID] = { width, height } (M.SetTextureSize). With wowui.layout, a
+-- texture showing such a file and given no size takes the file's size, as the client does once the file is loaded.
+M.textureSizes = {}
+
+-- The key a texture file's size is stored under: the path in lower case with backslashes and without extension.
+function M.TextureKey(file)
+	if type(file) == "number" then
+		return file
+	end
+	return (tostring(file):gsub("/", "\\"):lower():gsub("%.[%w]+$", ""))
+end
+
+function M.SetTextureSize(file, width, height)
+	M.textureSizes[M.TextureKey(file)] = { width, height }
+end
 
 -- "Every file exists": a stable made-up file ID per path, mapped back to the path in dumps (M.syntheticPaths), so a
 -- renderer can look the file up by name. Set M.fileResolver = M.SyntheticFileID to use it.
@@ -679,6 +694,9 @@ DEFAULTS = {
 		self._texture, self._color = nil, nil
 		self._atlas = name
 		self._coords = nil
+		if M.atlasQueries and type(name) == "string" then
+			M.atlasQueries[name] = true
+		end
 		if useAtlasSize and C_Texture and C_Texture.GetAtlasInfo then
 			local info = C_Texture.GetAtlasInfo(name)
 			if info and info.width then
@@ -2120,13 +2138,20 @@ function M.Install()
 			M.fileQueries[path] = true
 		end
 		local id = M.files[path:lower()]
+		if id == nil then -- the client does not mind the kind of slash
+			id = M.files[(path:gsub("/", "\\")):lower()]
+		end
 		if id == nil and M.fileResolver then
 			id = M.fileResolver(path)
 		end
 		return id or nil
 	end
+	-- M.atlasQueries, when set (the runner sets it), records every atlas name asked about, like M.fileQueries.
 	_G.C_Texture = {
 		GetAtlasInfo = function(name)
+			if M.atlasQueries and type(name) == "string" then
+				M.atlasQueries[name] = true
+			end
 			local a = M.atlases[name]
 			if a then
 				local w, h = 16, 16

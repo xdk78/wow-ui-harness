@@ -86,5 +86,23 @@ Lines have `line`: `{ from: [x, y], to: [x, y], thickness, color, vertex, file, 
 ## Lint output
 
 The runner writes `<prefix>lint.json` next to the dumps: `{ "findings": [{ rule, key, message, rect, path, view }] }`,
-and `<prefix>files-asked.txt` (every path the addon passed to GetFileIDFromPath). A baseline file holds one
+`<prefix>files-asked.txt` (every path the addon passed to GetFileIDFromPath) and `<prefix>atlases-asked.txt` (every
+atlas name passed to C_Texture.GetAtlasInfo or SetAtlas), sorted, one per line. A baseline file holds one
 `<view> | <key>` per line.
+
+## Recorded sizes: `wowui-sizes/1`
+
+`wowui.py files --sizes <file>` writes, and the runner's `--sizes <file>` reads, facts about the game files a run used
+(keys sorted):
+
+```jsonc
+{
+  "schema": "wowui-sizes/1",
+  "files": {                                   // every path asked or drawn that the client (or an --addon folder) has
+    "Interface\\Buttons\\WHITE8X8": { "id": 130871, "size": [8, 8] },   // file data ID, width and height in pixels
+    "Interface\\Streamed\\NotYet":  { "id": 123456 },                   // known, not downloaded: no size
+    "Interface\\AddOns\\MyAddon\\Media\\Logo": { "size": [128, 64] }    // an addon's own file: no ID
+  },
+  "atlases": { "common-icon-checkmark": [18, 16] }  // the asked atlases the client has: width and height
+}
+```

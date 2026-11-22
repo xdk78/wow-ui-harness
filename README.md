@@ -119,7 +119,7 @@ runner settles sizes as the client does between frames: every shown frame whose 
 baseline's header comment and the `#` comment lines right above each key that stays (say there why it is accepted). Runner options:
 `--font-root <prefix>=<dir>` (repeatable), `--fallback-font`, `--fallback-scale`, `--only a,b`,
 `--prefix <text>` (prefix view names, e.g. a locale), `--baseline`, `--update-baseline`, `--all-files`, `--files`,
-`--atlases`, `--width`, `--height`. `examples/dump_example.lua` is a complete one for the example addon in
+`--atlases`, `--sizes` (see "Layout parity in CI" below), `--width`, `--height`. `examples/dump_example.lua` is a complete one for the example addon in
 `examples/HarnessExample/`. The JSON format is in [docs/DUMP-FORMAT.md](docs/DUMP-FORMAT.md).
 
 ### 3. Render with the game's art
@@ -148,6 +148,31 @@ uv run --script $H/python/wowui.py render  --game "$G" --dump <work>/dump --out 
   a streamed install has not downloaded is a grey placeholder; a file the client does not have is magenta; an unknown
   atlas is orange.
 - The game folder is only read. Keep work folders outside your repository: fonts and renders contain game files.
+
+### Layout parity in CI: recorded sizes
+
+A layout can depend on the game's files: a texture given no size takes its file's pixel size, `SetAtlas(name, true)`
+and `C_Texture.GetAtlasInfo` use the atlas's size, and an addon may branch on whether `GetFileIDFromPath` knows a
+file. CI has no game, so record those facts once and commit them:
+
+```sh
+lua my_dump.lua --out <work>/dump --all-files            # writes files-asked.txt and atlases-asked.txt
+uv run --script $H/python/wowui.py files --game "$G" --dump <work>/dump --sizes tests/ui-sizes.json --addon MyAddon=.
+lua my_dump.lua --out <work>/dump --sizes tests/ui-sizes.json   # locally and in CI: the same layout
+```
+
+The JSON (`wowui-sizes/1`, see [docs/DUMP-FORMAT.md](docs/DUMP-FORMAT.md)) lists, for the files and atlases the dump
+asked about or drew, the client's file ID and each file's width and height in pixels, and each atlas's width and
+height. With `--sizes` (or the runner config's `sizes = "tests/ui-sizes.json"`) and no `--files` / `--atlases`,
+`GetFileIDFromPath` and `C_Texture.GetAtlasInfo` answer from it, and with `wowui.layout` a texture with no size (or a
+size of 0) whose file is listed takes the file's size, as the client does once the file has loaded. `--addon
+Name=folder` also records the sizes of the addon's own image files. A file the client knows but a streamed install has
+not downloaded gets its ID without a size. Re-record after a game patch or when the addon starts using other files.
+
+Why committing it is fine: the file holds facts about the game's files (paths, numeric file IDs, widths and heights),
+no pixels, no file contents and nothing from which an image could be rebuilt; it is the kind of information the game's
+own API returns to every addon at run time (`GetFileIDFromPath`, `C_Texture.GetAtlasInfo`). Textures, fonts and renders
+stay out of the repository.
 
 ### Lint
 

@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- `wowui.perf.count(fn, ...)`: the number of Lua VM instructions `fn` takes, for deterministic performance budgets in
+  tests (count hook; restores a previous hook, also on error; counts coroutines `fn` creates).
 - Mock: client behaviour for unit tests. `SetSize` / `SetWidth` / `SetHeight` fire `OnSizeChanged` when the size
   changes; `Show` / `Hide` / `SetParent` fire `OnShow` / `OnHide` on the frame and its shown descendants when
   visibility changes (and only then); `GetScript` returns the handler and `HookScript` / `SetScript` keep hooks as the

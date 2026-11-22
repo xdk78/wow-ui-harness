@@ -9,7 +9,7 @@ particular addon.
 
 - `lua/wowui/` the Lua package: `mock` (client API), `layout` (anchors, sizes, scales, text), `text` (markup and line
   layout), `ttf` (font metrics and character maps), `dump` (frame tree as JSON), `lint`, `runner` (command line),
-  `json`.
+  `json`, `perf` (instruction counts for budgets).
 - `python/` `wowui.py` (PEP 723 script: `render`, `lint`, `fonts`, `atlases`, `files`, `check`), `casc.py` (CASC
   storage, read-only), `db2.py` (WDC3-5 tables), `check.py` (static safety lint of an addon's Lua; standard library
   only, also runnable on its own).

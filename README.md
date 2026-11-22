@@ -88,6 +88,23 @@ Scripts, sizes and visibility work as in the client, so tests can drive an addon
   `Install`); `GetItemInfoInstant` / `C_Item.GetItemInfoInstant` take an ID, a link or a listed name and return the
   client's seven values, or nothing.
 
+#### Performance budgets
+
+`wowui.perf.count(fn, ...)` runs `fn(...)` and returns how many Lua VM instructions it took (then `fn`'s results):
+the same number on every run and machine, so a test can hold a code path to a budget without timing it.
+
+```lua
+local Perf = require("wowui.perf")
+local n = Perf.count(function() MyAddon:RefreshList() end)
+assert(n < 40000, "RefreshList: " .. n .. " instructions")
+```
+
+It uses a count hook (`debug.sethook`): a hook set before (a coverage tool's) keeps its events and is put back, also
+when `fn` raises; coroutines `fn` creates are counted. Limits: a call into a C function counts as one instruction;
+counts differ between Lua builds (5.1 and 5.2+ compile differently, LuaJIT skips hooks in compiled code), so record
+budgets with the Lua 5.1 your CI runs; coroutines that existed before and are resumed inside are not counted; counting
+makes code much slower, so measure small pieces of work.
+
 ### 2. Describe your views and run the dump
 
 ```lua
@@ -493,7 +510,7 @@ vscode-wow-api project and the wowless headless client.
 
 ## Repository
 
-- `lua/wowui/` the Lua package (`mock`, `layout`, `text`, `ttf`, `dump`, `lint`, `runner`, `views`, `json`)
+- `lua/wowui/` the Lua package (`mock`, `layout`, `text`, `ttf`, `dump`, `lint`, `runner`, `views`, `json`, `perf`)
 - `python/` the command line (`wowui.py`), its visual tools (`visual.py`: `gif`, `compare`, atlas sheets), its game
   readers (`casc.py`, `db2.py`) and the static check (`check.py`)
 - `lib/LibUIShots-1.0/` the in-game library

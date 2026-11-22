@@ -32,6 +32,8 @@
 --                              Default: the config's `sizes`. Every run writes the atlas names asked to
 --                              <out>/atlases-asked.txt.
 -- ctx (passed to prepare and setup): { mock, args, out }.
+-- A view may also carry `meta` (fields copied into its dump's meta) and `needs` (another view that is set up first when
+-- it has not run yet). `wowui.views` builds both for interaction sequences (`seq-<name>-NN`).
 
 local JSON = require("wowui.json")
 local Dump = require("wowui.dump")
@@ -245,21 +247,48 @@ function Runner.Main(M, cfg, argv)
 	end
 	local all, written = {}, {}
 	local prefix = args.prefix or ""
+	-- A view's setup runs once. A view with `needs` (a step of wowui.views' Sequence) has the view it builds on set up
+	-- first when that one was not selected, so `--only` of a later step shows the same state as a full run.
+	local ran, sequences, started = {}, {}, {}
+	local function setUp(view)
+		if ran[view] then
+			return true
+		end
+		if view.needs and not setUp(view.needs) then
+			return false
+		end
+		ran[view] = true
+		if view.sequence and not started[view.sequence] then
+			started[view.sequence] = true
+			sequences[#sequences + 1] = view.sequence
+		end
+		local ok, err = pcall(view.setup, ctx)
+		if not ok then
+			io.stderr:write(string.format("view %s: setup failed: %s\n", view.name, tostring(err)))
+			return false
+		end
+		-- Sizes settle the way the client's do between frames: OnSizeChanged for every frame whose size changed.
+		Layout.SettleSizes(M)
+		return true
+	end
 	for _, view in ipairs(cfg.views or {}) do
 		if not args.only or args.only[view.name] then
-			local ok, err = pcall(view.setup, ctx)
-			if not ok then
-				io.stderr:write(string.format("view %s: setup failed: %s\n", view.name, tostring(err)))
+			if not setUp(view) then
 				return 3
 			end
-			-- Sizes settle the way the client's do between frames: OnSizeChanged for every frame whose size changed.
-			Layout.SettleSizes(M)
 			local window = view.window
 			if type(window) == "function" then
 				window = window(ctx)
 			end
 			local name = prefix .. view.name
-			local doc = Dump.Capture(M, { view = name, window = window, meta = cfg.meta and cfg.meta(ctx, view) or nil })
+			local meta = cfg.meta and cfg.meta(ctx, view) or nil
+			if view.meta then
+				meta = meta or {}
+				for k, v in pairs(view.meta) do
+					meta[k] = v
+				end
+			end
+			local doc = Dump.Capture(M, { view = name, window = window, meta = meta })
 			local path = args.out .. "/" .. fileName(name) .. ".json"
 			Dump.Write(doc, path)
 			written[#written + 1] = path
@@ -278,6 +307,13 @@ function Runner.Main(M, cfg, argv)
 			if view.teardown then
 				view.teardown(ctx)
 			end
+		end
+	end
+	-- A sequence whose last step was not part of the run still gets its finish.
+	for _, seq in ipairs(sequences) do
+		if not seq.done and seq.finish then
+			seq.done = true
+			seq.finish(ctx)
 		end
 	end
 	local asked = {}

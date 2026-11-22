@@ -9,7 +9,7 @@ down (the client uses bottom-left; the dump converts). A rect is `[x, y, width, 
   "schema": "wowui-dump/1",
   "harness": "0.2.0",              // wowui.mock's version
   "view": "home",                  // the view's name (with the runner's --prefix, e.g. "plPL/home")
-  "meta": { ... },                 // whatever the caller passed
+  "meta": { ... },                 // whatever the caller passed; a sequence step (wowui.views) adds sequence, step, steps, caption
   "screen": [1920, 1080],          // UIParent's size
   "window": {                      // the view's window, when the caller named one
     "path": "MyAddonFrame", "rect": [460, 200, 1000, 680], "id": 1

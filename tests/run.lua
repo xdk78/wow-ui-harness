@@ -56,7 +56,7 @@ function T.case(name, fn)
 end
 
 for _, file in ipairs({ "test_mock.lua", "test_layout.lua", "test_text.lua", "test_dump_lint.lua", "test_shots.lua",
-	"test_client.lua", "test_sizes.lua" }) do
+	"test_client.lua", "test_sizes.lua", "test_views.lua" }) do
 	assert(loadfile("tests/" .. file))(T)
 end
 

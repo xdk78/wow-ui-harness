@@ -39,6 +39,17 @@
   Textures and lines draw only their visible part, so huge or off-canvas geometry stays cheap.
 - Dump: textures record `rotationPoint` and `wrap` (SetTexture's wrap modes), lines `coords`; a line without
   SetThickness is 4 thick, the client's default (also `GetThickness` with `wowui.layout` on).
+- `wowui gif`: an animated GIF from rendered frames (files or globs, a `seq-<name>-NN` sequence, or a JSON spec): crop
+  (`auto` too), scale or width, per-frame time, captions in a band (from the dumps' `meta.caption`, the spec or the
+  command line; drawn in the font Pillow carries), one shared palette without dithering, loop count, and `--max-bytes`
+  to reduce colours and then width until the file fits.
+- `wowui.views` (`Views.Sequence`): declare an interaction as steps that run cumulatively on one state, as views named
+  `seq-<name>-NN` with the caption in the dump's `meta`. The runner accepts a view's `meta` and `needs`; `--only` of a
+  later step sets up the earlier ones first. The example dump script has a sequence.
+- `wowui compare A B`: A | B | pixel diff in one PNG for two images or two render folders, with `--crop`, `--zoom`,
+  `--labels`, `--tolerance` and `--threshold`; exit code 1 when they differ.
+- `wowui atlases --search <text>` and `--sheet <png>` (`--filter`, `--columns`, `--cell`, `--max`): find atlases by name
+  and draw a labelled contact sheet from the client's textures. `--out` is optional now.
 
 ## [0.2.0] - 2026-11-16
 

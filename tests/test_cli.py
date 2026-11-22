@@ -12,6 +12,7 @@ Needs `lua` (5.1) on PATH: it dumps the example addon first, then renders and li
 from __future__ import annotations
 
 import io
+import math
 import shutil
 import struct
 import subprocess
@@ -67,13 +68,35 @@ def test_db2_plain_fields():
     assert list(d.rows()) == [(7, [7, 100]), (9, [9, 200])]
 
 
+RED, BLUE = (255, 0, 0, 255), (0, 0, 255, 255)
+
+
+def _halves(size=8):
+    """A source texture: the left half red, the right half blue."""
+    img = Image.new("RGBA", (size, size), BLUE)
+    img.paste(RED, (0, 0, size // 2, size))
+    return img
+
+
+def _render(regions, addons=None, size=(40, 40)):
+    """Draw a hand-made dump through the renderer (no game install: addon files only)."""
+    doc = {"schema": "wowui-dump/1", "view": "t", "screen": list(size), "regions": regions}
+    img, _ = wowui.Renderer(wowui.Game(None, addons or {}), ROOT, 1.0).render(doc, "screen")
+    return img
+
+
+def _texture(rect, **tex):
+    return {"id": 1, "kind": "Texture", "path": "t", "rect": rect, "alpha": 1, "texture": tex}
+
+
 def test_texcoords_flip_and_crop():
     img = Image.new("RGBA", (4, 2))
     img.putpixel((0, 0), (255, 0, 0, 255))
-    out = wowui._crop_coords(img, [0, 0.5, 0, 1])
+    out = wowui._sample(img, (2, 2), [0, 0.5, 0, 1])
     assert out.size == (2, 2)
-    flipped = wowui._crop_coords(img, [0.5, 0, 0, 1])
-    assert flipped.getpixel((1, 0)) == (255, 0, 0, 255)
+    assert out.getpixel((0, 0))[0] > 100, "the crop keeps the red corner"
+    flipped = wowui._sample(img, (2, 2), [0.5, 0, 0, 1])
+    assert flipped.getpixel((1, 0))[0] > 100, "flipped: the red corner is on the right"
 
 
 def test_image_size_from_headers():
@@ -88,6 +111,124 @@ def test_image_size_from_headers():
     Image.new("RGBA", (5, 7)).save(buf, "TGA")
     assert wowui.image_size(buf.getvalue()) == (5, 7)
     assert wowui.image_size(b"not an image") is None
+
+
+def test_texcoords_eight_values():
+    src = _halves()
+    mirror = wowui._sample(src, (16, 16), [1, 0, 1, 1, 0, 0, 0, 1])
+    assert mirror.getpixel((3, 8)) == BLUE and mirror.getpixel((12, 8)) == RED, "mirrored left to right"
+    # The quad's top edge samples the image's left column, bottom to top: the image turned a quarter clockwise.
+    turned = wowui._sample(src, (16, 16), [0, 1, 1, 1, 0, 0, 1, 0])
+    assert turned.getpixel((8, 3)) == RED and turned.getpixel((8, 12)) == BLUE, "a quarter turn"
+    # A shear: the top edge samples x 0..0.5, the bottom edge x 0.5..1 (the red/blue border runs diagonally).
+    sheared = wowui._sample(src, (16, 16), [0, 0, 0.5, 1, 0.5, 0, 1, 1])
+    assert sheared.getpixel((12, 1)) == RED and sheared.getpixel((3, 14)) == BLUE, "sheared"
+    assert sheared.getpixel((8, 1)) == RED and sheared.getpixel((8, 14)) == BLUE
+
+
+def test_texcoords_past_one_follow_the_wrap_mode():
+    src = _halves()
+    wide = [0, 2, 0, 1]  # twice the image across
+    rep = wowui._sample(src, (32, 8), wide, wrap=["REPEAT", "CLAMP"])
+    assert [rep.getpixel((x, 4)) for x in (4, 12, 20, 28)] == [RED, BLUE, RED, BLUE]
+    mirror = wowui._sample(src, (32, 8), wide, wrap=["MIRROR", "CLAMP"])
+    assert [mirror.getpixel((x, 4)) for x in (4, 12, 20, 28)] == [RED, BLUE, BLUE, RED]
+    clamp = wowui._sample(src, (32, 8), wide)  # the client's default: the edge pixels go on
+    assert [clamp.getpixel((x, 4)) for x in (4, 12, 20, 28)] == [RED, BLUE, BLUE, BLUE]
+    empty = wowui._sample(src, (32, 8), wide, wrap=["CLAMPTOBLACKADDITIVE", "CLAMP"])
+    assert empty.getpixel((28, 4))[3] == 0 and empty.getpixel((4, 4)) == RED
+
+
+def test_rotation_quarter_turn_lands_in_the_expected_halves():
+    with tempfile.TemporaryDirectory() as tmp:
+        _halves().save(Path(tmp) / "halves.png")
+        tex = {"file": "Interface\\AddOns\\Test\\halves", "rotation": math.pi / 2}
+        img = _render([_texture([0, 0, 64, 64], **tex)], {"Test": Path(tmp)}, (64, 64))
+        bg = _render([], size=(64, 64))
+    # Counter-clockwise a quarter turn: the image's left (red) half goes to the bottom. SetRotation also scales the
+    # image by 2^-0.5 around the rect's centre, so the rect's border stays empty.
+    assert img.getpixel((32, 42)) == RED and img.getpixel((32, 52)) == RED
+    assert img.getpixel((32, 22)) == BLUE and img.getpixel((32, 12)) == BLUE
+    assert img.getpixel((3, 3)) == bg.getpixel((3, 3)) and img.getpixel((32, 3)) == bg.getpixel((32, 3))
+
+
+def test_rotation_45_leaves_the_corners_empty():
+    with tempfile.TemporaryDirectory() as tmp:
+        Image.new("RGBA", (8, 8), (255, 255, 255, 255)).save(Path(tmp) / "white.png")
+        tex = {"file": "Interface\\AddOns\\Test\\white", "rotation": -math.pi / 4, "vertex": [0, 1, 0, 1]}
+        img = _render([_texture([0, 0, 64, 64], **tex)], {"Test": Path(tmp)}, (64, 64))
+        bg = _render([], size=(64, 64))
+    assert img.getpixel((32, 32)) == (0, 255, 0, 255), "the centre is drawn, with the vertex colour"
+    assert img.getpixel((32, 3)) == (0, 255, 0, 255), "the turned square reaches the middle of each edge"
+    for p in ((2, 2), (61, 2), (2, 61), (61, 61), (8, 8)):
+        assert img.getpixel(p) == bg.getpixel(p), f"corner {p} stays empty"
+    edge = img.getpixel((16, 15))  # the diamond's edge (x + y = 32) halves this pixel: anti-aliased
+    assert bg.getpixel((16, 15))[1] < edge[1] < 255, edge
+
+
+def test_rotation_point():
+    # A zero turn around the image's top-left corner puts that corner at the rect's centre (the client's formula).
+    out = wowui._sample(Image.new("RGBA", (8, 8), RED), (64, 64), rotation=0, point=[0, 0])
+    # The image (scaled by 2^-0.5) then covers 0.5..1.2 of the rect: its bottom-right part.
+    assert out.getpixel((48, 48)) == RED and out.getpixel((62, 62)) == RED
+    assert all(out.getpixel(p)[3] == 0 for p in ((16, 16), (48, 16), (16, 48), (30, 30)))
+
+
+def _line(a, b, thickness, **extra):
+    return {
+        "id": 1,
+        "kind": "Line",
+        "path": "l",
+        "rect": [0, 0, 1, 1],
+        "alpha": 1,
+        "line": dict(extra, **{"from": a, "to": b, "thickness": thickness}),
+    }
+
+
+def test_line_one_pixel_covers_its_row():
+    img = _render([_line([5, 10.5], [35, 10.5], 1, color=[1, 1, 1, 1])])
+    bg = _render([])
+    assert all(img.getpixel((x, 10)) == (255, 255, 255, 255) for x in range(5, 35))
+    assert img.getpixel((20, 9)) == bg.getpixel((20, 9)) and img.getpixel((20, 11)) == bg.getpixel((20, 11))
+    assert img.getpixel((4, 10)) == bg.getpixel((4, 10)) and img.getpixel((35, 10)) == bg.getpixel((35, 10)), (
+        "butt ends"
+    )
+
+
+def test_line_diagonal_is_antialiased():
+    img = _render([_line([5, 5], [35, 35], 3, color=[1, 1, 1, 1])])
+    bg = _render([])
+    for p in ((15, 15), (20, 20), (25, 25)):
+        assert img.getpixel(p) == (255, 255, 255, 255), f"centre pixel {p} fully covered"
+    edge = img.getpixel((20, 22))  # its centre is 1.41 from the line, the half thickness is 1.5: partly covered
+    assert bg.getpixel((20, 22))[0] < edge[0] < 255, edge
+    assert img.getpixel((20, 26)) == bg.getpixel((20, 26))
+
+
+def test_line_texture_runs_along_it():
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Image.new("RGBA", (8, 2), BLUE)
+        src.paste(RED, (0, 0, 8, 1))
+        src.save(Path(tmp) / "stripe.png")
+        img = _render([_line([4, 20], [36, 20], 4, file="Interface\\AddOns\\Test\\stripe")], {"Test": Path(tmp)})
+    # Drawn left to right, the texture's top row is the line's upper half.
+    assert img.getpixel((20, 18)) == RED and img.getpixel((20, 21)) == BLUE
+
+
+def test_render_is_deterministic():
+    with tempfile.TemporaryDirectory() as tmp:
+        _halves().save(Path(tmp) / "halves.png")
+        regions = [
+            _texture([2, 2, 30, 20], file="Interface\\AddOns\\Test\\halves", rotation=0.7, rotationPoint=[0.3, 0.6]),
+            _texture([20, 20, 16, 16], file="Interface\\AddOns\\Test\\halves", coords=[0, 0.1, 0.2, 1, 1, 0, 0.9, 0.8]),
+            _line([3, 37], [37, 9], 2.5, color=[1, 0.8, 0, 0.9]),
+        ]
+        out = []
+        for _ in range(2):
+            buf = io.BytesIO()
+            _render(regions, {"Test": Path(tmp)}).save(buf, "PNG", optimize=True)
+            out.append(buf.getvalue())
+    assert out[0] == out[1]
 
 
 def test_nine_slice_atlas_keeps_corners():

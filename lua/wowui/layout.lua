@@ -12,7 +12,8 @@
 --
 -- After Enable, region getters answer from the resolved layout: GetLeft/Right/Top/Bottom/Center/Rect, GetWidth/Height/
 -- Size, GetEffectiveScale, IsVisible, GetStringWidth/Height, GetUnboundedStringWidth, IsTruncated, GetFrameStrata
--- (inherited), GetFrameLevel (parent + 1 unless set), IsMouseEnabled (as set). Rectangles are in UIParent units with the
+-- (inherited), GetFrameLevel (parent + 1 unless set), IsMouseEnabled (as set), a line's GetThickness (the client's
+-- default 4 unless set). Rectangles are in UIParent units with the
 -- origin at the bottom left, like the client's; a region without anchors (or anchored to one without) has no rect.
 --
 -- How it resolves, as the client does: every anchor fixes one horizontal value (LEFT, RIGHT or centre) and one vertical
@@ -499,6 +500,9 @@ function Layout.Enable(M, opts)
 	end
 	D.IsMouseEnabled = function(r)
 		return r._mouse or false
+	end
+	D.GetThickness = function(r)
+		return r._thickness or M.LINE_THICKNESS
 	end
 	D.GetJustifyH = function(r)
 		return Layout.FontInfo(r).justifyH

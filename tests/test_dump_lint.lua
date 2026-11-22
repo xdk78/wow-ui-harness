@@ -28,11 +28,50 @@ T.case("dump: entries in draw order with rects, text lines, backdrops", function
 	local swatch = byPath["HarnessExampleFrame.swatch.tex"]
 	T.eq(swatch.rect[3], 20, "scale 0.5: 40 units are 20 on screen")
 	T.ok(win.id < label.id, "the window draws before its text")
+	local badge = byPath["HarnessExampleFrame.badge"]
+	T.near(badge.texture.rotation, math.pi / 6, "rotation", 0.001)
+	T.eq(badge.texture.rotationPoint, nil, "the default rotation point is not recorded")
+	T.eq(byPath["HarnessExampleFrame.stroke"].line.thickness, 3)
 	-- JSON round trip.
 	local JSON = require("wowui.json")
 	local back = JSON.Decode(JSON.Encode(doc))
 	T.eq(back.view, "example")
 	T.eq(#back.regions, #doc.regions)
+end)
+
+T.case("dump: rotation point, wrap modes and the client's default line thickness", function()
+	local mock, frame = buildExample()
+	local tex = frame:CreateTexture(nil, "ARTWORK")
+	tex:SetTexture("Interface\\Buttons\\WHITE8X8", "REPEAT", "MIRROR")
+	tex:SetAllPoints()
+	tex:SetRotation(1, { x = 0, y = 0.25 })
+	local plain = frame:CreateTexture(nil, "ARTWORK")
+	plain:SetTexture("Interface\\Buttons\\WHITE8X8", true)
+	plain:SetAllPoints()
+	local line = frame:CreateLine(nil, "ARTWORK")
+	line:SetColorTexture(1, 1, 1, 1)
+	line:SetStartPoint("TOPLEFT", frame)
+	line:SetEndPoint("BOTTOMRIGHT", frame)
+	T.eq(line:GetThickness(), 4, "GetThickness answers the client's default with layout on")
+	local doc = require("wowui.dump").Capture(mock, { view = "example", window = frame })
+	local t, p, l
+	for _, e in ipairs(doc.regions) do
+		if e.texture and e.texture.rotationPoint then
+			t = e.texture
+		elseif e.texture and e.texture.wrap then
+			p = e.texture
+		elseif e.line and e.line.thickness == 4 then
+			l = e.line
+		end
+	end
+	T.ok(t, "the turned texture")
+	T.eq(t.rotationPoint[1], 0)
+	T.eq(t.rotationPoint[2], 0.25)
+	T.eq(t.wrap[1], "REPEAT")
+	T.eq(t.wrap[2], "MIRROR")
+	T.eq(p.wrap[1], "REPEAT", "true is REPEAT")
+	T.eq(p.wrap[2], "CLAMP", "an omitted mode is CLAMP")
+	T.ok(l, "a line without SetThickness is 4 thick")
 end)
 
 T.case("lint: truncation and overlapping buttons are found, with stable keys", function()

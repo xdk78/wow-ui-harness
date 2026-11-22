@@ -1,6 +1,6 @@
 # wow-ui-harness
 
-See a World of Warcraft addon's UI without playing the game by hand. Version 0.2.0 (`VERSION`), MIT licence.
+See a World of Warcraft addon's UI without playing the game by hand. Version 0.3.0 (`VERSION`), MIT licence.
 
 - **Offline (plain Lua 5.1 + Python):** a WoW client API mock that loads your addon, resolves its layout the way the
   client does (anchors, sizes, scales, scroll frames, text with the real fonts), dumps the frame tree of chosen views as

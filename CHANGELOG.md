@@ -1,9 +1,7 @@
 # Changelog
 
-## [Unreleased]
+## [0.3.0] - 2026-11-22
 
-- `wowui.perf.count(fn, ...)`: the number of Lua VM instructions `fn` takes, for deterministic performance budgets in
-  tests (count hook; restores a previous hook, also on error; counts coroutines `fn` creates).
 - Mock: client behaviour for unit tests. `SetSize` / `SetWidth` / `SetHeight` fire `OnSizeChanged` when the size
   changes; `Show` / `Hide` / `SetParent` fire `OnShow` / `OnHide` on the frame and its shown descendants when
   visibility changes (and only then); `GetScript` returns the handler and `HookScript` / `SetScript` keep hooks as the
@@ -52,6 +50,8 @@
   `--labels`, `--tolerance` and `--threshold`; exit code 1 when they differ.
 - `wowui atlases --search <text>` and `--sheet <png>` (`--filter`, `--columns`, `--cell`, `--max`): find atlases by name
   and draw a labelled contact sheet from the client's textures. `--out` is optional now.
+- `wowui.perf.count(fn, ...)`: the number of Lua VM instructions `fn` takes, for deterministic performance budgets in
+  tests (count hook; restores a previous hook, also on error; counts coroutines `fn` creates).
 - `wowui api`: offline API lookup. Prints a function's, namespace's, event's, enumeration's or structure's signature,
   arguments and returns from the API documentation the client ships (`Blizzard_APIDocumentationGenerated`, read from its
   CASC storage or from `--docs <folder>`; the tables are parsed, not run). `--search`, `--expand`, `--json`, `--cache`.

@@ -51,7 +51,7 @@ import check as check_mod  # noqa: E402
 import db2  # noqa: E402
 import visual  # noqa: E402
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 UI_TEXTURE_ATLAS = 897470  # DBFilesClient/UiTextureAtlas.db2 (file data ID)
 UI_TEXTURE_ATLAS_MEMBER = 897532  # DBFilesClient/UiTextureAtlasMember.db2

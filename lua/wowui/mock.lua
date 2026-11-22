@@ -10,7 +10,7 @@
 
 local M = {}
 
-M.VERSION = "0.2.0"
+M.VERSION = "0.3.0"
 
 local frames = {}
 M.frames = frames

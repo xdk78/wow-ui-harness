@@ -113,7 +113,13 @@ function Runner.LoadSizes(M, path, use)
 	if not ok or type(doc) ~= "table" or doc.schema ~= "wowui-sizes/1" then
 		return nil, path .. " is not a wowui-sizes/1 file"
 	end
-	for file, info in pairs(doc.files or {}) do
+	local names = {}
+	for file in pairs(doc.files or {}) do
+		names[#names + 1] = file
+	end
+	table.sort(names) -- spellings that differ only in case: the same answer on every run
+	for _, file in ipairs(names) do
+		local info = doc.files[file]
 		if type(info) == "table" then
 			if type(info.size) == "table" then
 				M.SetTextureSize(file, info.size[1], info.size[2])
@@ -127,7 +133,11 @@ function Runner.LoadSizes(M, path, use)
 		end
 	end
 	if use.atlases and doc.atlases then
+		-- Atlases the addon's test setup registered stay (the recorded ones win on a clash).
 		local known = {}
+		for name, v in pairs(M.atlases or {}) do
+			known[tostring(name):lower()] = v
+		end
 		for name, size in pairs(doc.atlases) do
 			known[name:lower()] = { width = size[1], height = size[2] }
 		end

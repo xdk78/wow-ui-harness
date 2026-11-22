@@ -960,7 +960,7 @@ def cmd_files(a):
             raw = game._addon_file(path) if game else None
             size = image_size(raw) if raw else None
             if size:
-                files[path] = {"size": list(size)}
+                files[path.replace("/", "\\")] = {"size": list(size)}
             continue
         p = path.replace("/", "\\")
         tries = [p] if "." in p.rsplit("\\", 1)[-1] else []
@@ -979,12 +979,17 @@ def cmd_files(a):
             size = image_size(raw) if raw else None  # None: streamed and not downloaded yet
             if size:
                 entry["size"] = list(size)
-        files[path] = entry
+        files[p] = entry
     if a.out:
         Path(a.out).write_text("\n".join(lines) + "\n", encoding="utf-8")
         print(f"wowui: {len(lines)} of {len(paths)} paths exist in the client; written to {a.out}")
     if a.sizes:
-        known = Game(Path(a.game), {}).atlases()
+        g = Game(None, {})
+        g.casc = c  # the storage opened above
+        known = g.atlases()
+        if atlas_names and not known:
+            print("wowui files: the client's atlas tables could not be read; no sizes file written", file=sys.stderr)
+            return 2
         atlases = {}
         for name in sorted(atlas_names):
             v = known.get(name.lower())

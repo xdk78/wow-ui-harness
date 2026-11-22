@@ -79,6 +79,8 @@ def test_texcoords_flip_and_crop():
 def test_image_size_from_headers():
     blp = b"BLP2" + struct.pack("<I", 1) + bytes([2, 8, 7, 1]) + struct.pack("<II", 256, 128) + bytes(64)
     assert wowui.image_size(blp) == (256, 128), "BLP2 header"
+    blp1 = b"BLP1" + struct.pack("<II", 1, 8) + struct.pack("<II", 32, 16) + bytes(64)
+    assert wowui.image_size(blp1) == (32, 16), "BLP1 header"
     buf = io.BytesIO()
     Image.new("RGBA", (24, 12)).save(buf, "PNG")
     assert wowui.image_size(buf.getvalue()) == (24, 12)

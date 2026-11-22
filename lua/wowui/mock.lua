@@ -32,12 +32,19 @@ M.files = {} -- [lower-case path] = file ID: GetFileIDFromPath knows it
 -- texture showing such a file and given no size takes the file's size, as the client does once the file is loaded.
 M.textureSizes = {}
 
--- The key a texture file's size is stored under: the path in lower case with backslashes and without extension.
+-- The key a texture file's size is stored under: a file ID (also given as a numeric string), else the path in lower
+-- case with backslashes and without an image extension.
+local IMAGE_EXT = { blp = true, tga = true, png = true, jpg = true, jpeg = true }
 function M.TextureKey(file)
-	if type(file) == "number" then
-		return file
+	if type(file) == "number" or tonumber(file) then
+		return tonumber(file)
 	end
-	return (tostring(file):gsub("/", "\\"):lower():gsub("%.[%w]+$", ""))
+	local key = tostring(file):gsub("/", "\\"):lower()
+	local stem, ext = key:match("^(.*)%.(%w+)$")
+	if stem and IMAGE_EXT[ext] then
+		return stem
+	end
+	return key
 end
 
 function M.SetTextureSize(file, width, height)

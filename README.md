@@ -169,10 +169,11 @@ size of 0) whose file is listed takes the file's size, as the client does once t
 Name=folder` also records the sizes of the addon's own image files. A file the client knows but a streamed install has
 not downloaded gets its ID without a size. Re-record after a game patch or when the addon starts using other files.
 
-Why committing it is fine: the file holds facts about the game's files (paths, numeric file IDs, widths and heights),
-no pixels, no file contents and nothing from which an image could be rebuilt; it is the kind of information the game's
-own API returns to every addon at run time (`GetFileIDFromPath`, `C_Texture.GetAtlasInfo`). Textures, fonts and renders
-stay out of the repository.
+Why it is meant to be committable: the file holds facts about the game's files (paths, numeric file IDs, widths and
+heights), no pixels, no file contents and nothing from which an image could be rebuilt; the game's own API hands the
+same kind of facts to every addon at run time (`GetFileIDFromPath`, `C_Texture.GetAtlasInfo`). This is the reasoning
+behind the format, not legal advice or a licence grant: whether to commit it is the addon author's call. The sizes of
+an addon's own files (`--addon`) come from that addon's files. Textures, fonts and renders stay out of the repository.
 
 ### Lint
 

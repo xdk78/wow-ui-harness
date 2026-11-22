@@ -179,9 +179,12 @@ uv run --script <harness>/python/check.py       [same options]     # the same, w
 ```
 
 Output is one finding per line, `path:line: rule-id: message` (repo-relative paths with `/`, sorted), then a summary
-line. Exit code 0: no unsuppressed finding; 1: findings; 2: a config or usage error. `--format json` prints
-`{"findings": [{path, line, rule, message}], "summary": {files, findings, suppressed}}`. `paths` limit the check to
-files or folders; the config's `include` / `exclude` still apply.
+line. Exit code 0: no unsuppressed finding; 1: findings; 2: a config or usage error, a file that cannot be read, or
+**no files to check** (a typo in `include`, a wrong `--root`: a check that looked at nothing must not pass). `--format
+json` prints `{"findings": [{path, line, rule, message}], "summary": {files, findings, suppressed}}`. `paths` limit the
+check to files or folders; the config's `include` / `exclude` still apply, and a single file named in `paths` that they
+exclude (or that git does not list) is an error naming it. If `git ls-files` fails for a reason other than "not a git
+repository" (an ownership check, a broken config), a warning goes to stderr and the folder is walked instead.
 
 ### Config
 
@@ -210,8 +213,9 @@ turn a rule off; keys starting with `_` are ignored (use them for notes: JSON ha
 ```
 
 - `include` / `exclude`: globs over repo-relative paths. `**` is any depth, `*` and `?` stay within one path segment, a
-  pattern without `/` matches the file name at any depth, a trailing `/` means everything below. Defaults: include
-  `**/*.lua`, exclude `Libs/**` and `libs/**` (vendored libraries).
+  pattern without `/` matches the file name at any depth, a trailing `/` means everything below; backslashes count as
+  `/` and a leading `./` is dropped. Defaults: include `**/*.lua`, exclude `Libs/**` and `libs/**` (vendored
+  libraries).
 - `disable`: glob to a list of rule ids that are off for the matching files.
 - `rules.<id>`: `false` turns a rule off, `true` keeps its defaults, an object sets its parameters (and may carry
   `"enabled": false`). The defaults shown above are starting points, not a statement of what every addon must avoid:
@@ -225,28 +229,46 @@ turn a rule off; keys starting with `_` are ignored (use them for notes: JSON ha
 | `forbidden-call` | a call to a name in `calls` (a plain global such as `SetCVar` or `load`, also `_G.SetCVar(...)`, or a dotted name such as `C_CVar.SetCVar`; a local variable of the same name is not the global). Also `hooksecurefunc(Target, ...)` where Target is a string or the first name of the first argument and is in `hookTargets` (`hooksecurefunc(WorldMapFrame, ...)`, `hooksecurefunc("SomeGlobalFunc", ...)`, `hooksecurefunc(WorldMapFrame.ScrollContainer, ...)`), and `Frame:HookScript(...)` / `Frame.child:HookScript(...)` where Frame is in `hookTargets`. Add `hooksecurefunc` to `calls` to forbid it altogether. |
 | `combat-log` | `x:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")` and the other `events` (also AceEvent's `self:RegisterEvent(...)`); only a string literal first argument can be seen |
 | `new-global` | an assignment to a name that is not a local and not in `allow`: `Foo = ...`, `function Foo()`, `function Foo.bar()` / `function Foo:bar()` (defines a member of global `Foo`), `_G.Foo = ...`, `_G["Foo"] = ...`, `function _G.Foo()`. Field assignments such as `Foo.bar = 1` are not checked. `_G[name] = ...` with a computed key cannot be seen. |
-| `file-length` | a file over `maxLines` lines (default 1000; `overrides` maps globs to other limits, first match wins); reported at line 1 |
+| `file-length` | a file over `maxLines` lines (default 1000; `overrides` maps globs to other limits, first match wins), counted by newlines; reported at line 1 with a message that does not contain the current count, so baselines keyed on the text stay stable as the file changes |
 | `test-shell-find` | a test file (`tests`, default `tests/**`) whose `io.popen` / `os.execute` runs `find`, `dir` or `ls`: on Windows `find` is `find.exe`, a text search, so such a test passes vacuously; use `git ls-files` |
 | `unguarded-registration` | a registration that is not guarded (below): `tinsert(UISpecialFrames, ...)`, `table.insert(UISpecialFrames, ...)`, `UISpecialFrames[...] = ...`, a slash command variable `SLASH_X1 = ...` (also `_G["SLASH_X1"] = ...`), `SlashCmdList[...] = ...`, `SlashCmdList.X = ...`. Off when `guard` (a call such as `MyAddon:CanRegister`, or a list of them) is not set. |
-| `suppression-reason` | a suppression comment without a reason |
+| `suppression-reason` | a suppression comment without a reason, or naming a rule id that does not exist |
 
-**Guarded** means: the statement is lexically inside an `if` / `elseif` branch whose condition calls the guard (not
-negated: the branch of `if not guard() then` runs when the guard said no), or an enclosing function (or the file's top
-level) calls the guard earlier in the text, or an earlier `if` of the enclosing function has the guard in its condition
-and a first branch that starts with `return` (`if not guard() then return end`: the guard was consulted and the rest of
-the function runs under its answer). A guard call inside another function, or after the statement, does not count;
-a guard call in an `if` condition without such a `return` guards only that `if`. Calls are matched by their written
-name (`:` and `.` are the same), so `local g = MyAddon.CanRegister; g()` is not recognised.
+**Guarded** (`unguarded-registration`) is decided per `if` branch, not per `if`, and only these two ways count:
+
+1. The statement is inside a branch of an `if` / `elseif` / `else` that only runs after the guard said yes:
+   - the branch's own condition calls the guard and contains no `or` and no `not`: `if guard() then`, `if (guard()) then`,
+     `if a and guard() then`, `elseif guard() then`; or
+   - an earlier condition of the same `if` was exactly `[not] guard(...)` with an odd number of `not`s (`if not guard()
+     then ... else <here> end`): the later branches only run once the guard said yes.
+2. An earlier `if <a condition that calls the guard> then return ... end` ended before the statement, in the same
+   block, function or chunk (or an enclosing one): `if not guard() then return end` at the top of a function guards the
+   rest of that function, and the same at the top of the file guards the rest of the file. Either polarity counts
+   (`if guard() then return end` as well, and `if x or guard() then return end`) because what is checked is that the
+   guard was consulted before registering, not what it answered. An early return inside a nested block guards that
+   block only.
+
+Nothing else counts: a guard called as a statement or in an assignment (`local ok = guard()`) guards nothing after it
+(branch on it with `if not guard() then return end`), nor does an `if` that does not return, a guard called later, in
+another function or in another branch. A condition with `or`, or with `not` that is not the exact form above
+(`if not guard() and y then`, `if x or guard() then`), is not known to run only after a yes, so its body is reported.
+Calls are matched by their written name with `:` and `.` alike, after local aliases are resolved (below).
 
 **Limits.** The tokenizer follows Lua 5.1 (no `goto`, no integer division). Scope tracking is a heuristic, not a
 parser: a `local` counts from its declaration to the end of its block, `if` branches have separate scopes, and a
-`local x = function() x = 1 end` treats `x` as local inside the function (Lua treats it as global there). Aliases
-(`local f = SetCVar; f()`), calls through `pcall(SetCVar, ...)`, computed names and `loadstring`-ed code are not seen.
-A file Lua cannot parse is scanned as far as the tokenizer gets; the check never fails on a syntax error.
+`local x = function() x = 1 end` treats `x` as local inside the function (Lua treats it as global there). Local
+aliases of a global are followed when the local is initialised with exactly a global's name, `_G.Name` or `_G["Name"]`
+(`local SetCVar = SetCVar`, `local C_CVar = _G.C_CVar`, `local scv = SetCVar`, also one level through another alias, or
+as one of several positional initialisers up to the first one that is not a plain name): calls through it are still
+reported under the global's name. `local x = SetCVar or f` or a call result is not an alias, and `hooksecurefunc(alias,
+...)` is checked by the name written in the call. Calls through `pcall(SetCVar, ...)`, computed names, a function
+stored in a table field, and `loadstring`-ed code are not seen. A file Lua cannot parse is scanned as far as the
+tokenizer gets; the check never fails on a syntax error.
 
 ### Suppressions
 
-An inline comment on the same line or the line above a finding:
+An inline comment on the finding's line, or a comment alone on the line above it (a comment that trails other code
+covers only its own line):
 
 ```lua
 -- wowui-check: ignore new-global the client calls this by name
@@ -255,8 +277,9 @@ SetCVar("foo", 1) -- wowui-check: ignore forbidden-call set once on first run, w
 ```
 
 The reason after the rule id is required: without one the finding is still suppressed, but the comment itself is a
-`suppression-reason` finding. A suppression of a rule that has no finding there does nothing. Use `disable` in the
-config for whole paths, and put the line-1 comment for `file-length`.
+`suppression-reason` finding. A suppression naming an unknown rule id suppresses nothing and is also a
+`suppression-reason` finding; one naming a real rule that has no finding there does nothing. Use `disable` in the
+config for whole paths, and put the comment on line 1 for `file-length`.
 
 ### In CI
 

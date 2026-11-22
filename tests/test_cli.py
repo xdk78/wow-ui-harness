@@ -167,7 +167,10 @@ def test_check_tokenizer_skips_strings_and_comments():
     assert _scan(src + "\nSetCVar('real', 1)") == [(14, "forbidden-call")]
     toks, comments = check.tokenize("a = [[x\ny]] --[[c\nd]] b\n-- end")
     assert [(t.text, t.line) for t in toks] == [("a", 1), ("=", 1), ("x\ny", 1), ("b", 3)]
-    assert [line for line, _ in comments] == [2, 4]
+    assert [(line, alone) for line, _, alone in comments] == [(2, False), (4, True)]
+    # A string escape with a non-ASCII "digit" (superscript two) must not raise.
+    toks, _ = check.tokenize("x = 'a\\²b' y = 1")
+    assert [t.text for t in toks] == ["x", "=", "a²b", "y", "=", "1"]
     # Broken input does not raise.
     check.tokenize("x = 'unterminated\ny = [[ never closed")
     check.tokenize("--[==[ never closed")
@@ -222,6 +225,69 @@ def test_check_forbidden_hooks():
         ]
     )
     assert _scan(src, rules) == [(n, "forbidden-call") for n in (1, 2, 3, 4, 5, 10)]
+    assert _scan("hooksecurefunc(_G['WorldMapFrame'], 'Hide', f)", rules) == [(1, "forbidden-call")]
+    assert _scan("hooksecurefunc(_G['Other'], 'Hide', f)", rules) == []
+
+
+def test_check_local_aliases_of_globals():
+    # The upvalue idiom `local f = f` keeps pointing at the global for forbidden-call and the hook rules.
+    calls = [*check.DEFAULT_FORBIDDEN_CALLS, "C_CVar.SetCVar"]
+    rules = _only("forbidden-call", calls=calls, hookTargets=["WorldMapFrame", "PlayerFrame"])
+    flagged = [
+        "local SetCVar = SetCVar\nSetCVar(1)",
+        "local SetCVar = _G.SetCVar\nSetCVar(1)",
+        "local SetCVar = _G['SetCVar']\nSetCVar(1)",
+        "local C_CVar = C_CVar\nC_CVar.SetCVar(1)",
+        "local C_CVar = _G.C_CVar\nC_CVar.SetCVar(1)",
+        "local hooksecurefunc = hooksecurefunc\nhooksecurefunc(WorldMapFrame, 'Show', f)",
+        "local PlayerFrame = PlayerFrame\nPlayerFrame:HookScript('OnShow', f)",
+        "local SetCVar, b = SetCVar, 2\nSetCVar(1)",  # positional initialisers
+        "local a, SetCVar = Other, SetCVar\nSetCVar(1)",
+        "local scv = SetCVar\nscv(1)",  # an alias under another name is reported under the global's
+        "local a = SetCVar\nlocal b = a\nb(1)",  # an alias of an alias
+        "local SetCVar = SetCVar\ndo local x = 1; SetCVar(1) end\nfunction f() SetCVar(2) end",
+    ]
+    for src in flagged:
+        assert [r for _, r in _scan(src, rules)][:1] == ["forbidden-call"], src
+    assert _scan("local scv = SetCVar\nscv(1)", rules)[0][0] == 2
+    assert _scan("local SetCVar = SetCVar\nSetCVar(1)\nSetCVar(2)", rules) == [
+        (2, "forbidden-call"),
+        (3, "forbidden-call"),
+    ]
+    # Not aliases: a call result, an expression, another local, a shadowing parameter or a later redeclaration.
+    clean = [
+        "local SetCVar = SetCVar or function() end\nSetCVar(1)",
+        "local SetCVar = SetCVar(1)\nSetCVar(2)",
+        "local C_CVar = C_CVar.x\nC_CVar.SetCVar(1)",
+        "local mine = function() end\nlocal SetCVar = mine\nSetCVar(1)",
+        "local SetCVar = SetCVar\nlocal function f(SetCVar) SetCVar(1) end",
+        "local SetCVar = SetCVar\nlocal SetCVar = function() end\nSetCVar(1)",
+        "local SetCVar = SetCVar\nfor SetCVar in pairs(t) do SetCVar(1) end",
+        "local x = 1, SetCVar\nlocal SetCVar\nSetCVar(1)",
+        "if a then local SetCVar = SetCVar end\nlocal SetCVar = 1\nSetCVar(1)",
+    ]
+    for src in clean:
+        assert _scan(src, rules) == [], src
+    # The alias ends with its block.
+    assert _scan("do local SetCVar = SetCVar end\nSetCVar(1)", rules) == [(2, "forbidden-call")]
+    assert _scan("do local SetCVar = SetCVar end\nlocal SetCVar = 1\nSetCVar(1)", rules) == []
+    # An aliased local is still a local for new-global.
+    assert _scan("local SetCVar = SetCVar\nSetCVar = nil", _only("new-global")) == []
+
+
+def test_check_definitions_are_not_calls():
+    rules = _only("forbidden-call")
+    assert _scan("function load() end\nfunction SetCVar(a) end", rules) == []
+    assert _scan("function load() end\nfunction SetCVar(a) end", _only("new-global")) == [
+        (1, "new-global"),
+        (2, "new-global"),
+    ]
+    assert _scan("function M.load() end\nfunction M:SetCVar() end\nlocal function load() end", rules) == []
+
+
+def test_check_duplicate_findings_are_kept():
+    assert _scan("SetCVar(1) SetCVar(2)", _only("forbidden-call")) == [(1, "forbidden-call")] * 2
+    assert _scan("A = 1 A = 2", _only("new-global")) == [(1, "new-global")] * 2
 
 
 def test_check_combat_log():
@@ -323,7 +389,10 @@ def test_check_file_length():
     assert _scan("\n" * 9, rules, path="Data/Big.lua") == []
     assert _scan("\n" * 11, rules, path="Data/Big.lua") == [(1, "file-length")]
     found, _ = check.check_source("X.lua", "a\n" * 5, check.parse_config({"rules": rules}))
-    assert found[0].message == "5 lines, over the limit of 3"
+    assert found[0].message == "file is longer than 3 lines"  # no count: a baseline keys on the text
+    # Counting is by newline: form feeds and other splitlines separators are not line ends.
+    assert _scan("a\fb\x1cc\x0bd\x85e f", rules) == []
+    assert _scan("a\r\nb\rc\nd", rules) == [(1, "file-length")]
     # A suppression on line 1 works.
     assert _scan("-- wowui-check: ignore file-length generated data\na\nb\nc\n", rules) == []
 
@@ -378,28 +447,48 @@ def test_check_unguarded_registration():
     assert _scan(REGISTRATIONS, _only("unguarded-registration")) == []
     assert _scan(REGISTRATIONS, _only("unguarded-registration", guard="G", enabled=False)) == []
     guarded = [
-        # inside an if whose condition calls the guard
+        # inside an if branch whose condition calls the guard (no `or`, no `not`)
         "if MyAddon:CanRegister() then\n  tinsert(UISpecialFrames, 'F')\n  SLASH_X1 = '/x'\nend",
+        "if (MyAddon:CanRegister()) then SLASH_X1 = '/x' end",
         "if a and MyAddon.CanRegister() then SlashCmdList.X = f end",
-        # the enclosing function called the guard earlier
-        "function MyAddon:Setup()\n  local ok = MyAddon:CanRegister()\n  SLASH_X1 = '/x'\nend",
-        # the early-return forms, either polarity
+        "if a then x() elseif MyAddon:CanRegister() then SLASH_X1 = '/x' end",
+        # nested inside a guarded branch, also through a function defined there
+        "if MyAddon:CanRegister() then\nfor i = 1, 2 do SLASH_X1 = 1 end\nlocal f = function() SLASH_X2 = 1 end\nend",
+        # the branches after `if not guard()` only run once the guard said yes
+        "if not MyAddon:CanRegister() then x() else SLASH_X1 = '/x' end",
+        "if not (MyAddon:CanRegister()) then x() elseif y then SLASH_X1 = '/x' end",
+        # an earlier `if <condition with the guard> then return end` in the same function, either polarity
         "function f()\n  if not MyAddon:CanRegister() then return end\n  tinsert(UISpecialFrames, 'F')\nend",
         "function f()\n  if x or MyAddon:CanRegister() then return end\n  tinsert(UISpecialFrames, 'F')\nend",
-        # the chunk called it earlier, a nested function inherits it
-        "MyAddon:CanRegister()\nlocal function f() SLASH_X1 = '/x' end",
-        # elseif
-        "if a then x() elseif MyAddon:CanRegister() then SLASH_X1 = '/x' end",
+        "function f()\n  if MyAddon:CanRegister() then return end\n  local g = function() SLASH_X1 = 1 end\nend",
+        # ... at the top level of the file, and in a nested block
+        "if not MyAddon:CanRegister() then return end\nlocal function f() SLASH_X1 = '/x' end",
+        "function f()\n  if x then\n    if not MyAddon:CanRegister() then return end\n    SLASH_X1 = 1\n  end\nend",
     ]
     for src in guarded:
         assert _scan(src, on) == [], src
     unguarded = [
-        # the guard is called later, or only in a sibling function, or in another branch
+        # the guard is called later, or only in a sibling function
         "SLASH_X1 = '/x'\nMyAddon:CanRegister()",
         "function a() MyAddon:CanRegister() end\nfunction b() SLASH_X1 = '/x' end",
+        # calling the guard outside an `if` condition, or in an `if` that does not return, guards nothing after it
+        "function f()\n  local ok = MyAddon:CanRegister()\n  SLASH_X1 = '/x'\nend",
+        "MyAddon:CanRegister()\nlocal function f() SLASH_X1 = '/x' end",
         "if MyAddon:CanRegister() then x() end\nSLASH_X1 = '/x'",
+        "if not MyAddon:CanRegister() then x() end\nSLASH_X1 = '/x'",
+        # the guard is per branch: another branch of the same if is not guarded
+        "if MyAddon:CanRegister() then x() else SLASH_X1 = '/x' end",
+        "if MyAddon:CanRegister() then x() elseif y then SLASH_X1 = '/x' end",
         "if not MyAddon:CanRegister() then SLASH_X1 = '/x' end",
-        "if not MyAddon:CanRegister() then x() end\nSLASH_X1 = '/x'",  # not an early return
+        "if not (MyAddon:CanRegister()) then SLASH_X1 = '/x' end",
+        "if not MyAddon:CanRegister() and y then SLASH_X1 = '/x' end",
+        # `or` / `not` in the condition: the body may run without the guard saying yes
+        "if x or MyAddon:CanRegister() then SLASH_X1 = '/x' end",
+        "if MyAddon:CanRegister() and not y then SLASH_X1 = '/x' end",
+        # an early return inside a nested block ends with that block
+        "function f()\n  if x then\n    if not MyAddon:CanRegister() then return end\n  end\n  SLASH_X1 = 1\nend",
+        # a guard in an earlier branch's condition does not carry over to the else of a positive one
+        "function f()\nif a then\nif not MyAddon:CanRegister() then return end\nelse\nSLASH_X1 = 1\nend\nend",
         "if other() then SLASH_X1 = '/x' end",
         "-- MyAddon:CanRegister()\nSLASH_X1 = '/x'",
         "local s = 'MyAddon:CanRegister()'\nSLASH_X1 = '/x'",
@@ -440,6 +529,21 @@ def test_check_suppressions():
     # suppression-reason can be switched off.
     off = dict(only, **{"suppression-reason": False})
     assert (5, "suppression-reason") not in _scan(src, off)
+    # A comment trailing code covers its own line only; the line-above form is for a comment alone on its line.
+    trailing = "SetCVar(1) -- wowui-check: ignore forbidden-call why\nSetCVar(2)\n"
+    assert _scan(trailing, only) == [(2, "forbidden-call")]
+    alone = "-- wowui-check: ignore forbidden-call why\nSetCVar(1)\nSetCVar(2)\n"
+    assert _scan(alone, only) == [(3, "forbidden-call")]
+    assert _scan("--[[ wowui-check: ignore forbidden-call why ]] SetCVar(1)\nSetCVar(2)", only) == [
+        (2, "forbidden-call")
+    ]
+    # An unknown rule id is reported (it suppresses nothing); so is a missing reason after an unknown id.
+    unknown = "-- wowui-check: ignore forbidden-calls why\nSetCVar(1)"
+    assert _scan(unknown, only) == [(1, "suppression-reason"), (2, "forbidden-call")]
+    found, _ = check.check_source("a.lua", unknown, check.parse_config({"rules": only}))
+    assert "unknown rule 'forbidden-calls'" in [f for f in found if f.rule == "suppression-reason"][0].message
+    # The same call twice on a line: both are reported, and one comment covers both.
+    assert _scan("SetCVar(1) SetCVar(2) -- wowui-check: ignore forbidden-call why", only) == []
 
 
 def test_check_per_path_disable_and_glob():
@@ -455,6 +559,10 @@ def test_check_per_path_disable_and_glob():
     assert g("tests/**").fullmatch("tests/a/b.lua") and not g("tests/**").fullmatch("src/tests/a.lua")
     assert g("Libs/").fullmatch("Libs/x/y.lua") and not g("Libs/").fullmatch("Libs")
     assert g("a/*.lua").fullmatch("a/b.lua") and not g("a/*.lua").fullmatch("a/b/c.lua")
+    # Windows-style patterns work: backslashes are separators, a leading ./ is dropped.
+    assert g("tests\\**").fullmatch("tests/a/b.lua") and g("Data\\Gen\\*.lua").fullmatch("Data/Gen/x.lua")
+    assert g("./Libs/**").fullmatch("Libs/a.lua")
+    assert _scan("Foo = 1", _only("new-global"), path="tests/a.lua", disable={"tests\\**": ["new-global"]}) == []
     n = check.name_regex
     assert n("SLASH_MYADDON%d+").fullmatch("SLASH_MYADDON12") and not n("SLASH_MYADDON%d+").fullmatch("SLASH_MYADDON")
     assert n("BINDING_*").fullmatch("BINDING_HEADER_X") and not n("BINDING_*").fullmatch("XBINDING_")
@@ -569,6 +677,21 @@ def test_check_cli_exit_codes_and_output():
         assert _cli("--root", str(root), "no/such/file.lua")[0] == 2
         assert _cli("--root", str(root), str(root.parent))[0] == 2  # outside the root
         assert _cli("--root", str(root), "--format", "xml")[0] == 2
+        # Nothing to check is an error, never a pass: a file named on the command line that the config excludes
+        # (or that has no Lua), an include that matches nothing, an empty folder.
+        code, out, err = _cli("--root", str(root), "Libs/Vendored.lua")
+        assert code == 2 and "Libs/Vendored.lua" in err and "excluded" in err and out == "", (code, out, err)
+        assert _cli("--root", str(root), "notes.txt")[0] == 2
+        typo = root.parent / (root.name + "-typo.json")
+        typo.write_text(json.dumps({"include": ["**/*.luaa"]}), encoding="utf-8")
+        try:
+            code, out, err = _cli("--root", str(root), "--config", str(typo))
+            assert code == 2 and "no files to check" in err and out == "", (code, out, err)
+        finally:
+            typo.unlink()
+        with tempfile.TemporaryDirectory() as empty:
+            code, _, err = _cli("--root", empty)
+            assert code == 2 and "no files to check" in err
 
 
 def test_check_lists_files_with_git():
@@ -588,8 +711,12 @@ def test_check_lists_files_with_git():
         assert check.list_files(root) == [".gitignore", "a.lua", "b/c.lua"]
         (root / "a.lua").unlink()  # tracked but deleted
         assert check.list_files(root) == [".gitignore", "b/c.lua"]
-        code, out, _ = _cli("--root", str(root))
-        assert code == 1 and out.splitlines()[0].startswith("b/c.lua:1:")
+        code, out, err = _cli("--root", str(root))
+        assert code == 1 and out.splitlines()[0].startswith("b/c.lua:1:") and err == "", (code, out, err)
+        # A git failure other than "not a repository" is not silent: warn, then walk.
+        (root / ".git" / "config").write_text("[broken\n", encoding="utf-8")
+        code, out, err = _cli("--root", str(root))
+        assert code == 1 and "warning: git ls-files failed" in err and "b/c.lua:1:" in out, (code, out, err)
 
 
 def test_check_example_addon_is_checkable():

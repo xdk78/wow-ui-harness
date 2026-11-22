@@ -1,5 +1,28 @@
 # Changelog
 
+## [Unreleased]
+
+- Mock: client behaviour for unit tests. `SetSize` / `SetWidth` / `SetHeight` fire `OnSizeChanged` when the size
+  changes; `Show` / `Hide` / `SetParent` fire `OnShow` / `OnHide` on the frame and its shown descendants when
+  visibility changes (and only then); `GetScript` returns the handler and `HookScript` / `SetScript` keep hooks as the
+  client does (`mock.FireScript` runs both); `FontString:IsTruncated()` without layout; `IsMouseEnabled` as set;
+  input driving (`mock.SetCursor`, `SetKeyDown`, `SetMouseButtonDown`, `WithInput`, `GetCursorPosition`,
+  `IsMouseButtonDown`, the modifier-key functions) and sequences (`mock.Click`, `Drag`, `Hover`, `Leave`, `Wheel`;
+  `RegisterForClicks` and `RegisterForDrag` are honoured); `MenuUtil` with Blizzard_Menu's element descriptions,
+  `SetEnabled` predicates, `Pick` and responses, and test helpers (`menu:Click`, `Find`, `Lines`, `IsOpen`);
+  `GetItemInfoInstant` / `C_Item.GetItemInfoInstant` with the seven values from `mock.items`; `C_Timer.NewTicker`
+  iterations, timers in time order, `mock.Advance(seconds, step)`.
+- Behaviour changes an addon's tests may notice: `Show` on a shown frame no longer fires `OnShow`; `OnUpdate` runs only
+  for visible frames (not just shown ones); `frame:GetScript(name)(...)` no longer runs hooks (use `mock.FireScript` or
+  `mock.Click`); `IsMouseButtonDown` now exists and says false unless a test holds a button; after `SetSize`,
+  `wowui.layout.SettleSizes` has nothing left to report for that frame; `MenuUtil.CreateContextMenu` returns the menu
+  (it still has the root's `Create*` methods), and its `items` lists every element in order, titles, dividers and
+  checkboxes included; `mock.Click` / `mock.Drag` do nothing for a frame that is not visible or has the mouse disabled.
+- What an addon's own mock layer can drop: its own `IsMouseEnabled`, `IsTruncated` and `RegisterForClicks` overrides,
+  `GetItemInfoInstant` / `C_Item.GetItemInfoInstant` stubs (fill `mock.items`), replacements of `GetCursorPosition`,
+  `IsMouseButtonDown` and `IsShiftKeyDown` in tests (`mock.WithInput`), hand-run `OnMouseDown` / `OnDragStart` /
+  `OnUpdate` / `OnDragStop` / `OnMouseUp` sequences (`mock.Drag`), and `MenuUtil` fakes.
+
 ## [0.2.0] - 2026-11-16
 
 - Lint: `anchor-conflict`, a region whose anchor points put the same edge or centre in two places (the dump records

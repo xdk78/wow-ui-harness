@@ -11,14 +11,12 @@ Needs `lua` (5.1) on PATH: it dumps the example addon first, then renders and li
 
 from __future__ import annotations
 
-import io
-import json
-import math
-import os
 import argparse
 import contextlib
 import io
 import json
+import math
+import os
 import random
 import shutil
 import struct
@@ -1004,6 +1002,8 @@ def test_check_example_addon_is_checkable():
     findings, checked, _ = check.check_tree(ROOT, cfg, ["examples", "lib"])
     assert checked >= 3, checked
     assert all(f.rule in check.RULES for f in findings)
+
+
 def _quiet(argv):
     """wowui.main(argv) with its output captured: (exit code, stdout)."""
     out = io.StringIO()

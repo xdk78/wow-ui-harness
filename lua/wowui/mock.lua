@@ -70,6 +70,10 @@ local function hasScript(f, name)
 	return (f._scripts and f._scripts[name]) or (f._hooks and f._hooks[name]) or nil
 end
 
+local function pack(...)
+	return { n = select("#", ...), ... }
+end
+
 -- Run a frame's script the way the client does: the handler, then every hook with the same arguments. Returns the
 -- handler's results. `M.FireScript(button, "OnClick", "LeftButton", false)`.
 function M.FireScript(f, name, ...)
@@ -81,11 +85,11 @@ function M.FireScript(f, name, ...)
 		end
 		return
 	end
-	local r = fn and { fn(f, ...) } or {}
+	local r = fn and pack(fn(f, ...)) or { n = 0 }
 	for _, hook in ipairs(hooks) do
 		hook(f, ...)
 	end
-	return unpack(r)
+	return unpack(r, 1, r.n)
 end
 local fireScript = M.FireScript
 
@@ -111,7 +115,8 @@ local function removeChild(p, f)
 	end
 end
 
--- Shown with every ancestor shown: what the client calls visible (IsVisible), whether or not layout is enabled.
+-- Shown with every ancestor shown: what the client calls visible. Scripts follow it whether or not layout is enabled;
+-- the IsVisible getter answers it only with wowui.layout (without, it stays IsShown, as before).
 local function visible(f)
 	local guard = 0
 	while f and guard < 200 do
@@ -125,7 +130,8 @@ local function visible(f)
 end
 
 -- OnShow / OnHide for a frame that became visible / hidden and for each of its descendants that is shown itself
--- (so it changed visibility with it), parent first.
+-- (so it changed visibility with it), parent first. A handler that hides, shows or reparents something on the way is
+-- respected: a child gets OnShow only while it is visible, OnHide only while it is not.
 local function fireTree(f, name)
 	if hasScript(f, name) then
 		fireScript(f, name)
@@ -134,14 +140,15 @@ local function fireTree(f, name)
 	if kids then
 		local copy = { unpack(kids) } -- a handler may reparent or create frames
 		for _, k in ipairs(copy) do
-			if k._shown ~= false and k._parent == f then
+			if k._shown ~= false and k._parent == f and visible(k) == (name == "OnShow") then
 				fireTree(k, name)
 			end
 		end
 	end
 end
 
--- The size OnSizeChanged compares: the resolved one with wowui.layout, else the size set (0 when none).
+-- The size OnSizeChanged compares and reports: the resolved one with wowui.layout, else the size set (0 for a side not
+-- set, not the placeholder GetWidth / GetHeight answer).
 local function sizeNow(f)
 	if M.layout then
 		return f:GetWidth() or 0, f:GetHeight() or 0
@@ -1079,9 +1086,20 @@ local function frameStep(seconds)
 		end
 		return (a.seq or 0) < (b.seq or 0)
 	end)
-	for _, t in ipairs(due) do
+	for i, t in ipairs(due) do
 		if not t.cancelled then
-			t.fn(t.handle)
+			local ok, err = pcall(t.fn, t.handle)
+			if not ok then
+				-- The error goes to the test; the timers not run yet stay due, a ticker keeps ticking.
+				for j = i + 1, #due do
+					M.timers[#M.timers + 1] = due[j]
+				end
+				if t.every then
+					t.at = M.now + t.every
+					M.timers[#M.timers + 1] = t
+				end
+				error(err, 0)
+			end
 			if t.left then -- a ticker with a number of iterations
 				t.left = t.left - 1
 				if t.left <= 0 then
@@ -1208,19 +1226,39 @@ end
 -- A click as the client delivers it: OnMouseDown, (OnClick if registered for the down stroke), OnMouseUp, then
 -- PreClick / OnClick / PostClick for a button registered for that click (RegisterForClicks; default "LeftButtonUp")
 -- and enabled. A check button toggles before OnClick. Returns whether OnClick ran.
+-- A frame that is not visible or has the mouse disabled (EnableMouse(false)) gets nothing, as in the client. If a
+-- handler errors, the button is released before the error goes on.
+local function pointable(f)
+	return visible(f) and f._mouse ~= false
+end
+
+local function released(button, ok, ...)
+	M.SetMouseButtonDown(button, false)
+	if not ok then
+		error((...), 0)
+	end
+	return ...
+end
+
 function M.Click(f, button)
 	button = button or "LeftButton"
+	if not pointable(f) then
+		return false
+	end
 	M.SetMouseButtonDown(button, true)
-	runIf(f, "OnMouseDown", button)
-	local clicked = click(f, button, true)
-	M.SetMouseButtonDown(button, false)
-	runIf(f, "OnMouseUp", button, true)
-	return click(f, button, false) or clicked
+	return released(button, pcall(function()
+		runIf(f, "OnMouseDown", button)
+		local clicked = click(f, button, true)
+		M.SetMouseButtonDown(button, false)
+		runIf(f, "OnMouseUp", button, true)
+		return click(f, button, false) or clicked
+	end))
 end
 
 -- A drag: the cursor at `from`, the button down (OnMouseDown), the cursor moves to `to` in `steps` frames; after the
--- first move OnDragStart (only for a frame registered for that button with RegisterForDrag, as in the client), and
--- each frame is a mock.Advance(elapsed) (OnUpdate, timers); at the end OnDragStop and OnMouseUp, the button released.
+-- first move OnDragStart (only for a frame registered for that button with RegisterForDrag, and only when the cursor
+-- moves, as in the client), and each frame is a mock.Advance(elapsed) (OnUpdate, timers); at the end OnDragStop and
+-- OnMouseUp, the button released (also when a handler errors). Not visible or mouse disabled: nothing happens.
 -- opts: { from = { x, y }, to = { x, y }, steps = 1, button = "LeftButton", elapsed = 1 / 60 }.
 function M.Drag(f, opts)
 	opts = opts or {}
@@ -1229,27 +1267,34 @@ function M.Drag(f, opts)
 	local to = opts.to or from
 	local steps = math.max(1, opts.steps or 1)
 	local dt = opts.elapsed or (1 / 60)
+	if not pointable(f) then
+		return
+	end
 	local drags = false
-	for _, b in ipairs(rawget(f, "_drag") or {}) do
-		if b == button or b == "AnyButton" then
-			drags = true
+	if to[1] ~= from[1] or to[2] ~= from[2] then
+		for _, b in ipairs(rawget(f, "_drag") or {}) do
+			if b == button or b == "AnyButton" then
+				drags = true
+			end
 		end
 	end
 	M.SetCursor(from[1], from[2])
 	M.SetMouseButtonDown(button, true)
-	runIf(f, "OnMouseDown", button)
-	for i = 1, steps do
-		M.SetCursor(from[1] + (to[1] - from[1]) * i / steps, from[2] + (to[2] - from[2]) * i / steps)
-		if i == 1 and drags then
-			runIf(f, "OnDragStart", button)
+	released(button, pcall(function()
+		runIf(f, "OnMouseDown", button)
+		for i = 1, steps do
+			M.SetCursor(from[1] + (to[1] - from[1]) * i / steps, from[2] + (to[2] - from[2]) * i / steps)
+			if i == 1 and drags then
+				runIf(f, "OnDragStart", button)
+			end
+			M.Advance(dt)
 		end
-		M.Advance(dt)
-	end
-	if drags then
-		runIf(f, "OnDragStop")
-	end
-	M.SetMouseButtonDown(button, false)
-	runIf(f, "OnMouseUp", button, true)
+		if drags then
+			runIf(f, "OnDragStop")
+		end
+		M.SetMouseButtonDown(button, false)
+		runIf(f, "OnMouseUp", button, true)
+	end))
 end
 
 -- The pointer enters / leaves a frame: OnEnter(self, true) / OnLeave(self, true); IsMouseOver answers in between.
@@ -1712,6 +1757,13 @@ function Menu:Lines()
 	return out
 end
 
+-- The root's Create* methods on the menu too (earlier versions of the mock returned the root description).
+for name in pairs(CREATE) do
+	Menu[name] = function(self, ...)
+		return self.root[name](self.root, ...)
+	end
+end
+
 local function openMenu(owner, root)
 	local menu = setmetatable({ owner = owner, root = root, open = true, refreshes = 0 }, menuMT)
 	menu.items = root.elements -- earlier versions of the mock returned the root with its items
@@ -1722,6 +1774,7 @@ end
 
 -- Install the generic client API into _G. Game data stubs (maps, journal, instances, ...) are the addon's to add.
 function M.Install()
+	M.ResetInput()
 	_G.bit = bitlib
 	_G.CreateFrame = M.CreateFrame
 	_G.UIParent = M.CreateFrame("Frame", "UIParent")

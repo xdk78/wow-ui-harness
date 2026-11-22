@@ -11,13 +11,15 @@ Needs `lua` (5.1) on PATH: it dumps the example addon first, then renders and li
 
 from __future__ import annotations
 
-import io
+import json
 import math
+import os
 import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 from pathlib import Path
 
@@ -215,19 +217,135 @@ def test_line_texture_runs_along_it():
     assert img.getpixel((20, 18)) == RED and img.getpixel((20, 21)) == BLUE
 
 
-def test_render_is_deterministic():
+def test_line_texture_vertical_and_right_to_left():
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Image.new("RGBA", (8, 2), BLUE)
+        src.paste(RED, (0, 0, 8, 1))
+        src.save(Path(tmp) / "stripe.png")
+        f = "Interface\\AddOns\\Test\\stripe"
+        down = _render([_line([20, 4], [20, 36], 4, file=f)], {"Test": Path(tmp)})
+        back = _render([_line([36, 20], [4, 20], 4, file=f)], {"Test": Path(tmp)})
+    # The texture turns with the line: its top is on the left of the direction of travel.
+    assert down.getpixel((21, 20)) == RED and down.getpixel((18, 20)) == BLUE, "drawn downwards: top on the right"
+    assert back.getpixel((20, 21)) == RED and back.getpixel((20, 18)) == BLUE, "drawn right to left: top below"
+
+
+def _atlas_game(sheet, name, slices=None):
+    """A Game without a client whose atlas table holds one atlas covering `sheet` (the tables' row layout)."""
+    game = wowui.Game(None, {})
+    game._atlases = {name: (999, 0, sheet.width, 0, sheet.height, sheet.width, sheet.height, 0, 0, 7)}
+    game._images[(None, 999)] = sheet
+    if slices:
+        game._slices[7] = slices
+    return game
+
+
+def test_line_with_an_atlas():
+    sheet = Image.new("RGBA", (16, 4), BLUE)
+    sheet.paste(RED, (0, 0, 8, 4))
+    game = _atlas_game(sheet, "test-line")
+    doc = {"schema": "wowui-dump/1", "screen": [40, 40], "regions": [_line([4, 20], [36, 20], 4, atlas="test-line")]}
+    img, _ = wowui.Renderer(game, ROOT, 1.0).render(doc, "screen")
+    assert img.getpixel((10, 19)) == RED and img.getpixel((30, 19)) == BLUE, "stretched along the line"
+
+
+def test_rotated_nine_slice_keeps_its_corners():
+    sheet = Image.new("RGBA", (20, 20), RED)
+    sheet.paste(BLUE, (4, 4, 16, 16))
+    game = _atlas_game(sheet, "test-panel", (4, 4, 4, 4, 0))
+    tex = {"atlas": "test-panel", "rotation": math.pi / 2}
+    doc = {"schema": "wowui-dump/1", "screen": [64, 64], "regions": [_texture([0, 0, 64, 64], **tex)]}
+    img, _ = wowui.Renderer(game, ROOT, 1.0).render(doc, "screen")
+    # Sliced at 64 x 64 (a 4 px border), then turned and scaled by 2^-0.5: the border is about 3 px, from y 9.4.
+    assert img.getpixel((32, 11)) == RED and img.getpixel((32, 16)) == BLUE
+
+
+def test_rotation_zero_draws_unchanged():
+    src = _halves()
+    plain = wowui._sample(src, (16, 16))
+    assert wowui._sample(src, (16, 16), rotation=0).tobytes() == plain.tobytes()
+    assert wowui._sample(src, (16, 16), rotation=0, point=[0.5, 0.5]).tobytes() == plain.tobytes()
+
+
+def test_colour_texture_rotation():
+    img = _render([_texture([0, 0, 64, 64], color=[1, 1, 0, 1], rotation=math.pi / 4)], size=(64, 64))
+    bg = _render([], size=(64, 64))
+    assert img.getpixel((32, 32)) == (255, 255, 0, 255) and img.getpixel((3, 3)) == bg.getpixel((3, 3))
+
+
+def test_wrap_fills_and_vertical_modes():
+    src = _halves()
+    wide = [0, 2, 0, 1]
+    assert wowui._sample(src, (32, 8), wide, wrap=["CLAMPTOBLACK", "CLAMP"]).getpixel((28, 4)) == (0, 0, 0, 255)
+    assert wowui._sample(src, (32, 8), wide, wrap=["CLAMPTOWHITE", "CLAMP"]).getpixel((28, 4)) == (255,) * 4
+    tall = src.transpose(Image.Transpose.TRANSPOSE)  # red on top, blue below
+    rep = wowui._sample(tall, (8, 32), [0, 1, 0, 2], wrap=["CLAMP", "REPEAT"])
+    assert [rep.getpixel((4, y)) for y in (4, 12, 20, 28)] == [RED, BLUE, RED, BLUE]
+    mirror = wowui._sample(tall, (8, 32), [0, 1, 0, 2], wrap=["CLAMP", "MIRROR"])
+    assert [mirror.getpixel((4, y)) for y in (4, 12, 20, 28)] == [RED, BLUE, BLUE, RED]
+
+
+def test_shrinking_is_filtered_per_axis():
+    # One-pixel stripes across, turned a quarter into 64 x 64: 8 source columns per output pixel along one axis, none
+    # along the other. Unfiltered, the output would alias to near black or white.
+    src = Image.new("RGBA", (512, 64), (0, 0, 0, 255))
+    for x in range(0, 512, 2):
+        src.paste((255, 255, 255, 255), (x, 0, x + 1, 64))
+    out = wowui._sample(src, (64, 64), [0, 1, 1, 1, 0, 0, 1, 0])
+    values = [out.getpixel((x, y))[0] for x in range(8, 56, 5) for y in range(8, 56, 5)]
+    assert all(90 < v < 165 for v in values), values
+
+
+def test_near_axis_aligned_coords_take_the_plain_path():
+    src = _halves()
+    exact = wowui._sample(src, (16, 16), [0, 0.5, 0, 1])
+    noisy = wowui._sample(src, (16, 16), [1e-9, 0, 0, 1 - 1e-9, 0.5, 1e-9, 0.5, 1])
+    assert noisy.tobytes() == exact.tobytes()
+
+
+def test_huge_geometry_stays_bounded():
+    start = time.perf_counter()
+    # A long diagonal mostly off the canvas (e.g. in a scrolled-away child): only the visible part is drawn.
+    img = _render([_line([0, 0], [20000, 20000], 3, color=[1, 1, 1, 1])])
+    assert img.getpixel((20, 20)) == (255, 255, 255, 255)
     with tempfile.TemporaryDirectory() as tmp:
         _halves().save(Path(tmp) / "halves.png")
+        f = "Interface\\AddOns\\Test\\halves"
+        # A textured line far longer than the canvas, and a texture rect far larger than it.
+        _render([_line([-30000, 20], [30000, 20], 4, file=f)], {"Test": Path(tmp)})
+        big = _render([_texture([-20000, -20000, 40040, 40040], file=f, rotation=0.3)], {"Test": Path(tmp)})
+        assert big.getpixel((20, 20))[3] == 255
+    huge = [0, 1e5, 0, 1e5]
+    mean = wowui._sample(_halves(), (64, 64), huge, wrap=["REPEAT", "REPEAT"])
+    r, g, b, a = mean.getpixel((32, 32))
+    assert 100 < r < 155 and 100 < b < 155 and a == 255, "periods under a pixel average out"
+    clamped = wowui._sample(_halves(), (64, 16), [0, 1e5, 0, 1])
+    assert clamped.getpixel((32, 8)) == BLUE, "past the image: its right edge, clamped"
+    wowui._sample(_halves(), (64, 64), huge, wrap=["MIRROR", "CLAMPTOBLACK"], rotation=1)
+    assert time.perf_counter() - start < 10
+
+
+def test_render_is_deterministic_across_processes():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        _halves().save(tmp / "halves.png")
+        f = "Interface\\AddOns\\Test\\halves"
         regions = [
-            _texture([2, 2, 30, 20], file="Interface\\AddOns\\Test\\halves", rotation=0.7, rotationPoint=[0.3, 0.6]),
-            _texture([20, 20, 16, 16], file="Interface\\AddOns\\Test\\halves", coords=[0, 0.1, 0.2, 1, 1, 0, 0.9, 0.8]),
+            _texture([2, 2, 30, 20], file=f, rotation=0.7, rotationPoint=[0.3, 0.6]),
+            _texture([20, 20, 16, 16], file=f, coords=[0, 0.1, 0.2, 1, 1, 0, 0.9, 0.8], wrap=["MIRROR", "REPEAT"]),
             _line([3, 37], [37, 9], 2.5, color=[1, 0.8, 0, 0.9]),
+            _line([2, 30], [38, 34], 3, file=f),
         ]
+        doc = {"schema": "wowui-dump/1", "view": "t", "screen": [40, 40], "regions": regions}
+        (tmp / "t.json").write_text(json.dumps(doc), encoding="utf-8")
         out = []
-        for _ in range(2):
-            buf = io.BytesIO()
-            _render(regions, {"Test": Path(tmp)}).save(buf, "PNG", optimize=True)
-            out.append(buf.getvalue())
+        for seed in ("1", "2"):  # separate interpreters, different hash seeds
+            dest = tmp / ("png" + seed)
+            cmd = [sys.executable, str(ROOT / "python" / "wowui.py"), "render", "--dump", str(tmp / "t.json")]
+            cmd += ["--out", str(dest), "--addon", f"Test={tmp}", "--crop", "screen"]
+            env = dict(os.environ, PYTHONHASHSEED=seed)
+            subprocess.run(cmd, check=True, env=env, stdout=subprocess.DEVNULL)
+            out.append((dest / "t.png").read_bytes())
     assert out[0] == out[1]
 
 
@@ -266,8 +384,6 @@ def test_dump_render_lint_end_to_end():
         base.write_text("", encoding="utf-8")
         assert wowui.main(["lint", "--dump", str(dump), "--baseline", str(base)]) == 1
         keys = []
-        import json
-
         for f in json.loads((dump / "lint.json").read_text(encoding="utf-8"))["findings"]:
             keys.append(f"{f['view']} | {f['key']}")
         base.write_text("\n".join(keys) + "\n", encoding="utf-8")

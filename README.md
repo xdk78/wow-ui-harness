@@ -358,10 +358,15 @@ textures (normal, disabled, checked; not highlight or pushed), status bar fill, 
 Drawn like the client: `SetTexCoord` with 4 or 8 values (crops, flips, quarter turns, rotations and shears; coordinates
 past 0..1 follow SetTexture's wrap modes: CLAMP repeats the edge pixels, REPEAT and MIRROR tile, the CLAMPTO* modes
 fill); `SetRotation(radians, point)` as the client documents it (the image moved by -point, scaled by 2^-0.5, turned
-counter-clockwise and centred, so a square turned 45 degrees just fits its rect and the rest of the rect stays empty);
+counter-clockwise and moved so the point lands on the rect's centre, so a square turned 45 degrees just fits its rect
+and the rest of the rect stays empty; a zero turn around another point moves the image, as documented, but
+`SetRotation(0)` around the centre draws the texture unchanged, since nothing shows the scale at angle 0);
 lines as a quad from start to end point with square ends, their thickness across (4 when not set, as in the client), a
 texture or atlas stretched along their length, edges anti-aliased. Vertex colour, desaturation, masks, alpha and
-additive blending apply after. Not checked against the client: how SetRotation combines with SetTexCoord (here the
+additive blending apply after. Only what is on the canvas is drawn, so huge or far-off rects, lines and coordinates
+cost no more than visible ones; texture coordinates thousands of periods across draw their average colour, and a
+clamped image squeezed under about two pixels may sit a pixel off. Not checked against the client: whether
+SetRotation(0) around the centre really draws at full size, how SetRotation combines with SetTexCoord (here the
 coordinates pick the image, then it turns), rotation of a rect that is not square (turned in the image's 0..1 space,
 as documented), and 8-value coordinates that do not form a parallelogram (bilinear here, two triangles in the client).
 

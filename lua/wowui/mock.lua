@@ -1410,7 +1410,7 @@ function Desc:Insert(d, index)
 	return d
 end
 
-local function button(text, callback, data)
+local function menuButton(text, callback, data)
 	local d = newDesc("button", text, data)
 	d.responder, d.fn = callback, callback
 	return d
@@ -1427,9 +1427,9 @@ end
 
 -- Standalone creators (MenuUtil.CreateButton...), and the same as methods that insert into a description.
 local CREATE = {
-	CreateButton = button,
+	CreateButton = menuButton,
 	CreateHighlightButton = function(text, data, onEnter)
-		local d = button(text, nil, data)
+		local d = menuButton(text, nil, data)
 		d.onEnter = onEnter
 		return d
 	end,
@@ -1466,7 +1466,7 @@ local CREATE = {
 		return d
 	end,
 	CreateColorSwatch = function(text, callback, colorInfo)
-		local d = button(text, callback, colorInfo)
+		local d = menuButton(text, callback, colorInfo)
 		d.kind = "colorswatch"
 		return d
 	end,

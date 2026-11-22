@@ -64,7 +64,10 @@ Textures have `texture`:
 | `color` | SetColorTexture's colour `[r, g, b, a]` |
 | `coords` | SetTexCoord's 4 (`l, r, t, b`) or 8 (`ULx, ULy, LLx, LLy, URx, URy, LRx, LRy`) values |
 | `vertex` | vertex colour `[r, g, b, a]` |
-| `blend`, `desaturated`, `rotation`, `tile`, `gradient` | as set |
+| `rotation` | SetRotation's radians (counter-clockwise) |
+| `rotationPoint` | SetRotation's `normalizedRotationPoint` as `[x, y]` in image space, when given (the client's default is the centre) |
+| `wrap` | SetTexture's wrap modes `[horizontal, vertical]` (`CLAMP`, `REPEAT`, `MIRROR`, `CLAMPTOBLACK`, `CLAMPTOWHITE`, `CLAMPTOBLACKADDITIVE`; `true` is `REPEAT`, an omitted one `CLAMP`), when given |
+| `blend`, `desaturated`, `tile`, `gradient` | as set |
 | `masks` | mask textures: `[{ file, atlas, rect }]` |
 
 Font strings (and edit boxes) have `text`:
@@ -81,7 +84,9 @@ Font strings (and edit boxes) have `text`:
 | `width`, `full` | the widest laid-out line; the text's single-line width |
 | `truncated` | the text was cut with "..." |
 
-Lines have `line`: `{ from: [x, y], to: [x, y], thickness, color, vertex, file, atlas }`.
+Lines have `line`: `{ from: [x, y], to: [x, y], thickness, color, vertex, file, atlas, coords }`. `thickness` is
+already scaled; a line without SetThickness has the client's default, 4. `coords` is SetTexCoord's values, as for
+textures.
 
 ## Lint output
 

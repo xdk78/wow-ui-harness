@@ -139,8 +139,9 @@ uv run --script $H/python/wowui.py render  --game "$G" --dump <work>/dump --out 
   using them takes the same branches as in game).
 - `render` draws textures from the client's CASC storage (BLP), addon files from `--addon Name=folder` (else the
   game's `Interface\AddOns`), atlases through the client's `UiTextureAtlas` tables, backdrops (BackdropTemplate's
-  edge pieces), masks (round portraits), lines, and text in the dump's font files at the dump's positions, each run
-  fitted to the width the layout measured (hinting widens small text). Nine-slice atlases (menus, dropdowns: the
+  edge pieces), masks (round portraits), texture coordinates (crops, flips, turns and shears; past 0..1 by the
+  texture's wrap mode), rotation, anti-aliased lines (plain or textured), and text in the dump's font files at the
+  dump's positions, each run fitted to the width the layout measured (hinting widens small text). Nine-slice atlases (menus, dropdowns: the
   client's `UiTextureAtlasElementSliceData`) keep their corners. `--lint` writes `<view>.lint.png` with the findings
   outlined and numbered; `--only a,b` draws only those views. Run it from the folder the dump's relative font
   paths start from, or pass `--root`.
@@ -354,6 +355,21 @@ children and scroll offsets, clipping, strata / frame level / layer / sublevel o
 textures (normal, disabled, checked; not highlight or pushed), status bar fill, backdrops, mask textures, lines, inline
 `|T|t` and `|A|a` pictures and colour codes, word wrap, MaxLines and "..." truncation.
 
+Drawn like the client: `SetTexCoord` with 4 or 8 values (crops, flips, quarter turns, rotations and shears; coordinates
+past 0..1 follow SetTexture's wrap modes: CLAMP repeats the edge pixels, REPEAT and MIRROR tile, the CLAMPTO* modes
+fill); `SetRotation(radians, point)` as the client documents it (the image moved by -point, scaled by 2^-0.5, turned
+counter-clockwise and moved so the point lands on the rect's centre, so a square turned 45 degrees just fits its rect
+and the rest of the rect stays empty; a zero turn around another point moves the image, as documented, but
+`SetRotation(0)` around the centre draws the texture unchanged, since nothing shows the scale at angle 0);
+lines as a quad from start to end point with square ends, their thickness across (4 when not set, as in the client), a
+texture or atlas stretched along their length, edges anti-aliased. Vertex colour, desaturation, masks, alpha and
+additive blending apply after. Only what is on the canvas is drawn, so huge or far-off rects, lines and coordinates
+cost no more than visible ones; texture coordinates thousands of periods across draw their average colour, and a
+clamped image squeezed under about two pixels may sit a pixel off. Not checked against the client: whether
+SetRotation(0) around the centre really draws at full size, how SetRotation combines with SetTexCoord (here the
+coordinates pick the image, then it turns), rotation of a rect that is not square (turned in the image's 0..1 space,
+as documented), and 8-value coordinates that do not form a parallelogram (bilinear here, two triangles in the client).
+
 Blizzard templates: the mock builds a template only when your test setup registers it (`mock.templates[name]`), and
 then only the parts you add; the dump records every frame's template name and nine-slice layout. The renderer draws
 the art of common ones from the client's atlases: ButtonFrameTemplate / PortraitFrameTemplate (background and metal
@@ -362,9 +378,10 @@ layouts PortraitFrameTemplate, ButtonFrameTemplateNoPortrait, InsetFrameTemplate
 piece offsets approximate). A template's font string without anchors is centred on its frame.
 
 Approximate or missing: text has no kerning or shaping and is measured with each face's advance widths (close to the
-client, not pixel-exact); other templates draw nothing of their own; texture rotation, gradients and tiling (other than backdrops) are drawn simply;
-NineSlice layouts, models, animations and cooldown swipes are not drawn; numeric file IDs from made-up stub data point
-at unrelated real files (stub IDs through `mock.SyntheticFileID` instead).
+client, not pixel-exact); other templates draw nothing of their own; gradients and SetHorizTile / SetVertTile tiling
+(other than backdrops) are drawn simply; NineSlice layouts, models, animations and cooldown swipes are not drawn;
+numeric file IDs from made-up stub data point at unrelated real files (stub IDs through `mock.SyntheticFileID`
+instead).
 
 ## Libraries and licences
 

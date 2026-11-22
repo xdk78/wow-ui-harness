@@ -749,8 +749,10 @@ DEFAULTS = {
 	SetBlendMode = function(self, mode)
 		self._blend = mode
 	end,
-	SetRotation = function(self, r)
+	-- normalizedRotationPoint is a vector2 (x, y in image space; the client's default is the centre).
+	SetRotation = function(self, r, point)
 		self._rotation = r
+		self._rotationPoint = type(point) == "table" and { point.x or 0.5, point.y or 0.5 } or nil
 	end,
 	SetGradient = function(self, orientation, c1, c2)
 		self._gradient = { orientation, c1, c2 }
@@ -1037,6 +1039,8 @@ DEFAULTS = {
 	end,
 }
 M.DEFAULTS = DEFAULTS
+-- The client's thickness for a line without SetThickness (the dump draws it; GetThickness answers it with layout on).
+M.LINE_THICKNESS = 4
 
 local mt = {
 	__index = function(_, k)

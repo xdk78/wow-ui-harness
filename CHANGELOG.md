@@ -32,6 +32,13 @@
   `GetFileIDFromPath` and `C_Texture.GetAtlasInfo` from it, and with `wowui.layout` a texture with no size takes its
   file's recorded size, as the client does. Runs write `atlases-asked.txt`; `mock.SetTextureSize`;
   `GetFileIDFromPath` no longer minds the kind of slash.
+- Renderer: textures sample through SetTexCoord's 4 or 8 values (rotations and shears as well as crops, flips and
+  quarter turns; coordinates past 0..1 follow the wrap mode) and SetRotation as the client documents it (rotation
+  point, the 2^-0.5 scale, empty corners; `SetRotation(0)` around the centre draws unchanged); lines are
+  anti-aliased quads with square ends at their thickness, plain or with their texture or atlas stretched along them.
+  Textures and lines draw only their visible part, so huge or off-canvas geometry stays cheap.
+- Dump: textures record `rotationPoint` and `wrap` (SetTexture's wrap modes), lines `coords`; a line without
+  SetThickness is 4 thick, the client's default (also `GetThickness` with `wowui.layout` on).
 
 ## [0.2.0] - 2026-11-16
 

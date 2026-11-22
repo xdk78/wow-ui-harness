@@ -136,6 +136,19 @@ local function color(c)
 	return { c[1] or 1, c[2] or 1, c[3] or 1, c[4] or 1 }
 end
 
+-- SetTexture's wrap modes as the client names them: true is REPEAT, nil or false the default CLAMP.
+local function wrapModes(w)
+	if not w then
+		return nil
+	end
+	local out = {}
+	for i = 1, 2 do
+		local v = w[i]
+		out[i] = v == true and "REPEAT" or (type(v) == "string" and v:upper()) or "CLAMP"
+	end
+	return out
+end
+
 local function textRecord(_, o, rect, s, info, lay)
 	local lines = {}
 	local block = lay.height * s
@@ -401,6 +414,8 @@ function Dump.Capture(M, opts)
 							blend = r._blend,
 							desaturated = r._desaturated or nil,
 							rotation = r._rotation,
+							rotationPoint = r._rotation and r._rotationPoint or nil,
+							wrap = wrapModes(r._wrap),
 							tile = (r._tileH or r._tileV) and { r._tileH or false, r._tileV or false } or nil,
 							gradient = r._gradient,
 						}
@@ -441,8 +456,9 @@ function Dump.Capture(M, opts)
 						end
 						local a, z = ep(r._startPoint), ep(r._endPoint)
 						if a and z then
-							re.line = { from = a, to = z, thickness = (r._thickness or 1) * rs,
-								color = color(r._color), vertex = color(r._vertex), file = r._texture, atlas = r._atlas }
+							re.line = { from = a, to = z, thickness = (r._thickness or M.LINE_THICKNESS) * rs,
+								color = color(r._color), vertex = color(r._vertex), file = r._texture, atlas = r._atlas,
+								coords = r._coords }
 							re.rect = { math.min(a[1], z[1]), math.min(a[2], z[2]), math.abs(a[1] - z[1]),
 								math.abs(a[2] - z[2]) }
 							keep = true

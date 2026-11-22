@@ -43,6 +43,17 @@ function ns.Build()
 	f.swatch.tex = f.swatch:CreateTexture(nil, "ARTWORK")
 	f.swatch.tex:SetAllPoints()
 	f.swatch.tex:SetColorTexture(0.8, 0.2, 0.2, 1)
+	-- An icon turned 30 degrees counter-clockwise, and a thick diagonal line.
+	f.badge = f:CreateTexture(nil, "ARTWORK")
+	f.badge:SetTexture("Interface\\Icons\\INV_Misc_QuestionMark")
+	f.badge:SetSize(36, 36)
+	f.badge:SetPoint("BOTTOMRIGHT", -10, 10)
+	f.badge:SetRotation(math.pi / 6)
+	f.stroke = f:CreateLine(nil, "ARTWORK")
+	f.stroke:SetColorTexture(1, 0.82, 0, 1)
+	f.stroke:SetThickness(3)
+	f.stroke:SetStartPoint("BOTTOMRIGHT", f, -84, 40)
+	f.stroke:SetEndPoint("BOTTOMRIGHT", f, -52, 62)
 	ns.frame = f
 	return f
 end

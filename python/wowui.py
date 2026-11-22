@@ -318,38 +318,240 @@ def _nine_slice(piece: Image.Image, margins, w: int, h: int, k: float) -> Image.
     return out
 
 
-def _crop_coords(img: Image.Image, coords):
-    """Apply SetTexCoord (4 values l, r, t, b, or 8 values UL, LL, UR, LR): crop, flip, rotate by quarter turns."""
+# What SetTexture's wrap modes draw outside the image (CLAMP repeats the edge pixels, REPEAT and MIRROR tile).
+_WRAP_FILL = {
+    "CLAMPTOBLACK": (0, 0, 0, 255),
+    "CLAMPTOWHITE": (255, 255, 255, 255),
+    "CLAMPTOBLACKADDITIVE": (0, 0, 0, 0),
+}
+
+
+def _tex_corners(coords):
+    """SetTexCoord as image coordinates of the rect's corners: upper left, lower left, upper right, lower right."""
     if not coords:
-        return img
-    if len(coords) == 4:
-        l, r, t, b = coords
-        ul, ll, ur, lr = (l, t), (l, b), (r, t), (r, b)
-    else:
-        ul, ll, ur, lr = (coords[0], coords[1]), (coords[2], coords[3]), (coords[4], coords[5]), (coords[6], coords[7])
-    xs = [p[0] for p in (ul, ll, ur, lr)]
-    ys = [p[1] for p in (ul, ll, ur, lr)]
-    W, H = img.size
-    x0, x1 = min(xs) * W, max(xs) * W
-    y0, y1 = min(ys) * H, max(ys) * H
-    # Coordinates past 0..1 wrap (clamp here: the edge pixels repeat).
-    box = (max(0, math.floor(x0)), max(0, math.floor(y0)), min(W, max(1, math.ceil(x1))), min(H, max(1, math.ceil(y1))))
-    if box[2] <= box[0] or box[3] <= box[1]:
-        return img.crop((0, 0, 1, 1))
-    out = img.crop(box)
-    # Orientation: where the top-left corner of the drawn quad samples from.
-    if abs(ul[0] - ll[0]) > 1e-6 and abs(ul[1] - ur[1]) > 1e-6:
-        # Rotated a quarter turn: the quad's top edge runs down the texture.
-        if ur[1] > ul[1]:
-            out = out.transpose(Image.Transpose.ROTATE_90)
-        else:
-            out = out.transpose(Image.Transpose.ROTATE_270)
-    else:
-        if ul[0] > ur[0]:
-            out = out.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-        if ul[1] > ll[1]:
-            out = out.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+        return (0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (1.0, 1.0)
+    c = [float(v) for v in coords]
+    if len(c) == 4:
+        l, r, t, b = c
+        return (l, t), (l, b), (r, t), (r, b)
+    return (c[0], c[1]), (c[2], c[3]), (c[4], c[5]), (c[6], c[7])
+
+
+def _bilerp(corners, x: float, y: float):
+    """The image coordinate at (x, y) of the rect (0..1, y down) for the corners of _tex_corners."""
+    ul, ll, ur, lr = corners
+    return tuple(ul[i] * (1 - x) * (1 - y) + ur[i] * x * (1 - y) + ll[i] * (1 - x) * y + lr[i] * x * y for i in (0, 1))
+
+
+def _rotation(radians: float, point=None):
+    """SetRotation as two maps in normalised coordinates (y down): rect -> image and image -> rect.
+
+    The client (warcraft.wiki.gg, API TextureBase SetRotation) moves the image by -point, scales it by 2^-0.5, turns it
+    counter-clockwise on screen by `radians` and moves it by (0.5, 0.5), so the point lands on the rect's centre ("a
+    zero-radian rotation around (-1, 0) makes the image vanish"): a square image turned 45 degrees around its centre
+    just fits the rect, and the rect outside the turned image is empty.
+    """
+    cx, cy = (float(point[0]), float(point[1])) if point else (0.5, 0.5)
+    cs, sn = math.cos(radians), math.sin(radians)
+    k = 2**0.5
+
+    def to_image(x, y):
+        dx, dy = (x - 0.5) * k, (y - 0.5) * k
+        return cx + cs * dx - sn * dy, cy + sn * dx + cs * dy
+
+    def to_rect(x, y):
+        dx, dy = (x - cx) / k, (y - cy) / k
+        return 0.5 + cs * dx + sn * dy, 0.5 - sn * dx + cs * dy
+
+    return to_image, to_rect
+
+
+def _coverage(size, points, ss: int = 4) -> Image.Image:
+    """Anti-aliased coverage ("L") of a convex polygon in pixel coordinates (pixel i spans i..i+1): ss x ss samples.
+    Computed in bands of rows, so memory follows the output size."""
+    w, h = size
+    out = Image.new("L", (w, h), 0)
+    pts = [(x * ss, y * ss) for x, y in points]
+    edges = list(zip(pts, pts[1:] + pts[:1], strict=True))
+    top, bottom = min(p[1] for p in pts), max(p[1] for p in pts)
+    band = 64
+    for b0 in range(0, h, band):
+        b1 = min(h, b0 + band)
+        if b1 * ss <= top or b0 * ss >= bottom:
+            continue
+        big = Image.new("L", (w * ss, (b1 - b0) * ss), 0)
+        d = ImageDraw.Draw(big)
+        # One span per sample row: the samples whose centres (j + 0.5) lie in [left, right) of the polygon there.
+        for row in range(b0 * ss, b1 * ss):
+            sy = row + 0.5
+            xs = [
+                p[0] + (sy - p[1]) * (q[0] - p[0]) / (q[1] - p[1])
+                for p, q in edges
+                if min(p[1], q[1]) <= sy < max(p[1], q[1])
+            ]
+            if len(xs) >= 2:
+                j0 = max(0, math.ceil(round(min(xs), 6) - 0.5))
+                j1 = min(w * ss - 1, math.ceil(round(max(xs), 6) - 0.5) - 1)
+                if j1 >= j0:
+                    d.rectangle([j0, row - b0 * ss, j1, row - b0 * ss], fill=255)
+        out.paste(big.resize((w, b1 - b0), Image.Resampling.BOX), (0, b0))
     return out
+
+
+def _intersect(a, b):
+    """The overlap of two boxes (x0, y0, x1, y1), or None."""
+    box = (max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3]))
+    return box if box[2] > box[0] and box[3] > box[1] else None
+
+
+def _extend(img: Image.Image, lo: int, hi: int, mode: str, axis: int) -> Image.Image:
+    """img over pixels lo..hi along an axis (0 across, 1 down), drawn past its edges the way a wrap mode samples."""
+    size = img.size[axis]
+    n = hi - lo
+    out_size = (n, img.height) if axis == 0 else (img.width, n)
+
+    def at(o):
+        return (o, 0) if axis == 0 else (0, o)
+
+    def strip(a, b, length):
+        box = (a, 0, b, img.height) if axis == 0 else (0, a, img.width, b)
+        return img.crop(box).resize(
+            (length, img.height) if axis == 0 else (img.width, length), Image.Resampling.NEAREST
+        )
+
+    if mode in ("REPEAT", "MIRROR"):
+        out = Image.new("RGBA", out_size)
+        flipped = img.transpose(Image.Transpose.FLIP_LEFT_RIGHT if axis == 0 else Image.Transpose.FLIP_TOP_BOTTOM)
+        k = lo // size
+        while k * size < hi:
+            out.paste(flipped if mode == "MIRROR" and k % 2 else img, at(k * size - lo))
+            k += 1
+        return out
+    out = Image.new("RGBA", out_size, _WRAP_FILL.get(mode, (0, 0, 0, 0)))
+    out.paste(img, at(-lo))
+    if mode not in _WRAP_FILL:  # CLAMP: the edge pixels go on
+        if lo < 0:
+            out.paste(strip(0, 1, -lo), at(0))
+        if hi > size:
+            out.paste(strip(size - 1, size, hi - size), at(size - lo))
+    return out
+
+
+def _wrap_modes(wrap):
+    """The dump's wrap pair as (horizontal, vertical) mode names; CLAMP when not set."""
+    out = []
+    for i in (0, 1):
+        v = wrap[i] if wrap and len(wrap) > i else None
+        v = "REPEAT" if v is True else str(v or "CLAMP").upper()
+        out.append(v if v in ("REPEAT", "MIRROR", *_WRAP_FILL) else "CLAMP")
+    return out
+
+
+def _turn(rotation, point):
+    """SetRotation's maps, or None when nothing turns: no rotation, or 0 around the default centre (drawn unchanged:
+    addons reset with SetRotation(0), and the documentation shows no shrink at angle 0)."""
+    if rotation is None:
+        return None
+    centred = not point or (abs(float(point[0]) - 0.5) < 1e-9 and abs(float(point[1]) - 0.5) < 1e-9)
+    if float(rotation) == 0 and centred:
+        return None
+    return _rotation(float(rotation), point)
+
+
+def _sample(img: Image.Image, size, coords=None, rotation=None, point=None, wrap=None, window=None) -> Image.Image:
+    """img drawn into a w x h rect as the client samples it: SetTexCoord's 4 or 8 values (crop, flip, turn, skew),
+    SetRotation (radians, rotation point) and, for coordinates past 0..1, the wrap modes of SetTexture. Only `window`
+    (x0, y0, x1, y1 within the rect; default all of it) is drawn and returned, so memory follows what is visible.
+
+    Corners are mapped exactly and the inside bilinearly (Pillow's QUAD: exact for every parallelogram, which covers
+    crops, flips, rotations and shears); the client splits a non-parallelogram into two triangles instead.
+    """
+    w, h = size
+    x0, y0, x1, y1 = window or (0, 0, w, h)
+    ww, wh = x1 - x0, y1 - y0
+    corners = _tex_corners(coords)
+    turn = _turn(rotation, point)
+    ul, ll, ur, lr = corners
+
+    def same(a, b):
+        return abs(a - b) < 1e-6
+
+    inside = all(-1e-6 <= v <= 1 + 1e-6 for p in corners for v in p)
+    if turn is None and inside and same(ul[0], ll[0]) and same(ur[0], lr[0]) and same(ul[1], ur[1]):
+        if same(ll[1], lr[1]):
+            # Crop and flips only: a plain resize of the window's box (antialiased when it shrinks).
+            sw, sh = img.size
+            u0, u1 = (ul[0] + (ur[0] - ul[0]) * x / w for x in (x0, x1))
+            v0, v1 = (ul[1] + (ll[1] - ul[1]) * y / h for y in (y0, y1))
+            box = tuple(min(max(v, 0.0), 1.0) * s for v, s in ((min(u0, u1), sw), (min(v0, v1), sh)))
+            box += tuple(min(max(v, 0.0), 1.0) * s for v, s in ((max(u0, u1), sw), (max(v0, v1), sh)))
+            if box[2] > box[0] and box[3] > box[1]:
+                out = img.resize((ww, wh), Image.Resampling.BILINEAR, box=box)
+                if u0 > u1:
+                    out = out.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+                if v0 > v1:
+                    out = out.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+                return out
+
+    def uv(x, y):
+        x, y = x / w, y / h
+        return _bilerp(corners, *(turn[0](x, y) if turn else (x, y)))
+
+    quad = [list(uv(x0, y0)), list(uv(x0, y1)), list(uv(x1, y1)), list(uv(x1, y0))]  # Pillow's QUAD: UL, LL, LR, UR
+    modes = _wrap_modes(wrap)
+    sw, sh = img.size
+    # Shrinking: scale the source down per axis first (the transform samples without averaging). The factor is the
+    # most source pixels one output pixel spans along that source axis, from the quad's four edges.
+    edges = [(quad[3], quad[0], ww), (quad[2], quad[1], ww), (quad[1], quad[0], wh), (quad[2], quad[3], wh)]
+    size_now = [sw, sh]
+    for axis in (0, 1):
+        per_px = max(abs(a[axis] - b[axis]) * size_now[axis] / n for a, b, n in edges)
+        if per_px > 2:
+            # Keep a few pixels across a clamped axis so its edge colours survive.
+            least = 1 if modes[axis] in ("REPEAT", "MIRROR") else min(size_now[axis], 4)
+            size_now[axis] = max(least, round(size_now[axis] * 2 / per_px))
+    if tuple(size_now) != (sw, sh):
+        img = img.resize(tuple(size_now), Image.Resampling.LANCZOS)
+        sw, sh = img.size
+    cap = 4 * (ww + wh) + 64  # source pixels per axis: enough for anything the window can show
+    for axis, n in ((0, sw), (1, sh)):
+        lo, hi = min(p[axis] for p in quad), max(p[axis] for p in quad)
+        if modes[axis] in ("REPEAT", "MIRROR"):
+            period = 1 if modes[axis] == "REPEAT" else 2
+            shift = math.floor(lo / period) * period  # whole periods change nothing
+            for p in quad:
+                p[axis] -= shift
+            lo, hi = lo - shift, hi - shift
+            if (hi - lo) * n > cap:
+                # Periods smaller than an output pixel: the average colour along that axis.
+                img = img.resize((1, sh) if axis == 0 else (sw, 1), Image.Resampling.BOX)
+                sw, sh = img.size
+                for p in quad:
+                    p[axis] = 0.5
+        elif (hi - lo) * n > cap:
+            # Past its edges a clamped axis is constant: keep at most `cap` pixels of it (the image is then under
+            # about two output pixels across, and may move by about one).
+            k = max(1.0, (cap / n - 1) / 2)
+            for p in quad:
+                p[axis] = min(max(p[axis], -k), 1 + k)
+    xs = [p[0] * sw for p in quad]
+    ys = [p[1] * sh for p in quad]
+    lox, hix = math.floor(min(xs)) - 2, math.ceil(max(xs)) + 2
+    loy, hiy = math.floor(min(ys)) - 2, math.ceil(max(ys)) + 2
+    src = _extend(_extend(img, lox, hix, modes[0], 0), loy, hiy, modes[1], 1)
+    data = [round(v, 6) for x, y in zip(xs, ys, strict=True) for v in (x - lox, y - loy)]
+    out = src.transform((ww, wh), Image.Transform.QUAD, data, Image.Resampling.BICUBIC, fillcolor=(0, 0, 0, 0))
+    if turn:
+        out.putalpha(ImageChops.multiply(out.getchannel("A"), _rotation_mask((w, h), turn, (x0, y0, x1, y1))))
+    return out
+
+
+def _rotation_mask(size, turn, window=None) -> Image.Image:
+    """Where SetRotation's turned image lies in a w x h rect (the rest draws nothing), over `window` of it."""
+    w, h = size
+    x0, y0, x1, y1 = window or (0, 0, w, h)
+    pts = [turn[1](x, y) for x, y in ((0, 0), (1, 0), (1, 1), (0, 1))]
+    return _coverage((x1 - x0, y1 - y0), [(x * w - x0, y * h - y0) for x, y in pts])
 
 
 class Renderer:
@@ -381,9 +583,25 @@ class Renderer:
         self.fonts[key] = f
         return f
 
-    def texture_image(self, tex: dict, w: int, h: int, path_label: str) -> Image.Image | None:
+    def texture_image(self, tex: dict, w: int, h: int, path_label: str, window=None) -> Image.Image | None:
+        """The texture drawn into a w x h rect; only `window` (x0, y0, x1, y1 within it, default all) is returned."""
+        win = window or (0, 0, w, h)
+        size = (win[2] - win[0], win[3] - win[1])
+        rotation, point = tex.get("rotation"), tex.get("rotationPoint")
+
+        def whole(img):  # something drawn at the full size, cut to the window
+            return img if win == (0, 0, w, h) else img.crop(win)
+
+        def placeholder(label, color):
+            if w * h <= 4_000_000:
+                return whole(_placeholder(w, h, label, color))
+            return Image.new("RGBA", size, color + (60,))
+
         if tex.get("color") and not (tex.get("file") or tex.get("fileID") or tex.get("atlas")):
-            img = Image.new("RGBA", (w, h), _rgba(tex["color"]))
+            img = Image.new("RGBA", size, _rgba(tex["color"]))
+            turn = _turn(rotation, point)
+            if turn:
+                img.putalpha(ImageChops.multiply(img.getchannel("A"), _rotation_mask((w, h), turn, win)))
         else:
             img = None
             coords = tex.get("coords")
@@ -396,12 +614,17 @@ class Renderer:
                         img = sheet.crop((round(a[1] * sx), round(a[3] * sy), round(a[2] * sx), round(a[4] * sy)))
                         coords = tex.get("coords") if tex.get("coords") else None
                         sl = self.game.atlas_slices(tex["atlas"])
-                        if sl and (not coords or list(coords) in ([0, 1, 0, 1], [0, 0, 0, 1, 1, 0, 1, 1])):
+                        plain = not coords or list(coords) in ([0, 1, 0, 1], [0, 0, 0, 1, 1, 0, 1, 1])
+                        if sl and plain and w * h <= 16_000_000:
+                            # Sliced at the rect's size first; a rotation then turns the sliced picture.
                             k = self.scale / (2 if str(tex["atlas"]).lower().endswith("-2x") else 1)
-                            return _nine_slice(img, (sl[0] * sx, sl[1] * sy, sl[2] * sx, sl[3] * sy), w, h, k)
+                            img = _nine_slice(img, (sl[0] * sx, sl[1] * sy, sl[2] * sx, sl[3] * sy), w, h, k)
+                            if _turn(rotation, point) is None:
+                                return whole(img)
+                            coords = None
                 if img is None:
                     self.placeholders.append(("atlas", tex["atlas"], path_label))
-                    return _placeholder(w, h, "atlas " + str(tex["atlas"]), (255, 150, 0))
+                    return placeholder("atlas " + str(tex["atlas"]), (255, 150, 0))
             else:
                 img = self.game.image(file=tex.get("file"), file_id=tex.get("fileID"))
                 if img is None:
@@ -410,17 +633,14 @@ class Renderer:
                     if key in self.game.not_local:
                         # Exists in the client but not downloaded here: grey, it is not a bug.
                         self.placeholders.append(("not downloaded", name, path_label))
-                        return _placeholder(w, h, name.rsplit("\\", 1)[-1], (110, 110, 120))
+                        return placeholder(name.rsplit("\\", 1)[-1], (110, 110, 120))
                     self.placeholders.append(("file", name, path_label))
-                    return _placeholder(w, h, name.rsplit("\\", 1)[-1], (255, 0, 255))
-            img = _crop_coords(img, coords)
+                    return placeholder(name.rsplit("\\", 1)[-1], (255, 0, 255))
             if tex.get("desaturated"):
                 a = img.getchannel("A")
                 img = img.convert("L").convert("RGBA")
                 img.putalpha(a)
-            img = img.resize((w, h), Image.Resampling.BILINEAR)
-            if tex.get("color"):  # a colour texture with a file: the colour wins in the client too
-                pass
+            img = _sample(img, (w, h), coords, rotation, point, tex.get("wrap"), win)
         return img
 
     def paste(self, canvas: Image.Image, img: Image.Image, x: int, y: int, clip, additive=False):
@@ -666,10 +886,17 @@ class Renderer:
     def draw_texture(self, canvas, e):
         tex = e["texture"]
         x, y, w, h = (self.px(v) for v in e["rect"])
-        W, H = round(x + w) - round(x), round(y + h) - round(y)
+        X, Y = round(x), round(y)
+        W, H = round(x + w) - X, round(y + h) - Y
         if W <= 0 or H <= 0:
             return
-        img = self.texture_image(tex, W, H, e["path"])
+        # Only the part on the canvas and inside the clip is drawn (a rect can be far larger than the canvas).
+        vis = _intersect((X, Y, X + W, Y + H), (0, 0, canvas.width, canvas.height))
+        clip = self.clip_px(e)
+        vis = vis and (_intersect(vis, clip) if clip else vis)
+        if not vis:
+            return
+        img = self.texture_image(tex, W, H, e["path"], (vis[0] - X, vis[1] - Y, vis[2] - X, vis[3] - Y))
         if img is None:
             return
         vertex = tex.get("vertex")
@@ -681,12 +908,18 @@ class Renderer:
             if mimg is None:
                 continue
             mx, my, mw, mh = (self.px(v) for v in m["rect"])
-            mask = mimg.getchannel("A").resize((max(1, round(mw)), max(1, round(mh))), Image.Resampling.BILINEAR)
-            full = Image.new("L", (W, H), 0)
-            full.paste(mask, (round(mx - x), round(my - y)))
-
+            MX, MY = round(mx), round(my)
+            MW, MH = max(1, round(mw)), max(1, round(mh))
+            full = Image.new("L", img.size, 0)
+            part = _intersect(vis, (MX, MY, MX + MW, MY + MH))
+            if part:
+                alpha = mimg.getchannel("A")
+                kx, ky = alpha.width / MW, alpha.height / MH
+                box = ((part[0] - MX) * kx, (part[1] - MY) * ky, (part[2] - MX) * kx, (part[3] - MY) * ky)
+                size = (part[2] - part[0], part[3] - part[1])
+                full.paste(alpha.resize(size, Image.Resampling.BILINEAR, box=box), (part[0] - vis[0], part[1] - vis[1]))
             img.putalpha(ImageChops.multiply(img.getchannel("A"), full))
-        self.paste(canvas, img, round(x), round(y), self.clip_px(e), additive=tex.get("blend") == "ADD")
+        self.paste(canvas, img, vis[0], vis[1], clip, additive=tex.get("blend") == "ADD")
 
     def draw_text(self, canvas, e):
         t = e["text"]
@@ -772,21 +1005,78 @@ class Renderer:
             layer.alpha_composite(run.crop((sx, sy, run.width, run.height)), (dx + sx, dy + sy))
 
     def draw_line(self, canvas, e):
+        """A Line as the client draws it: a quad from the start to the end point (square ends there), `thickness`
+        across, its texture or atlas stretched along the length; edges anti-aliased."""
         ln = e["line"]
-        layer = Image.new("RGBA", canvas.size)
-        d = ImageDraw.Draw(layer)
-        color = ln.get("color") or [1, 1, 1, 1]
-        vertex = ln.get("vertex") or [1, 1, 1, 1]
-        c = [color[i] * vertex[i] for i in range(4)]
-        a = [self.px(v) for v in ln["from"]]
-        b = [self.px(v) for v in ln["to"]]
-        d.line([tuple(a), tuple(b)], fill=_rgba(c, e.get("alpha", 1)), width=max(1, round(self.px(ln["thickness"]))))
+        ax, ay = (self.px(v) for v in ln["from"])
+        bx, by = (self.px(v) for v in ln["to"])
+        t = self.px(ln.get("thickness") or 0)
+        length = math.hypot(bx - ax, by - ay)
+        if length < 1e-6 or t <= 0:
+            return
+        ux, uy = (bx - ax) / length, (by - ay) / length
+        nx, ny = uy, -ux  # the texture's top side: up for a line drawn left to right
+        hx, hy = nx * t / 2, ny * t / 2
+        quad = [(ax + hx, ay + hy), (bx + hx, by + hy), (bx - hx, by - hy), (ax - hx, ay - hy)]
+        box = (
+            math.floor(min(p[0] for p in quad)),
+            math.floor(min(p[1] for p in quad)),
+            math.ceil(max(p[0] for p in quad)),
+            math.ceil(max(p[1] for p in quad)),
+        )
+        # Only the part on the canvas and inside the clip is drawn (a line can run far past the canvas).
+        vis = _intersect(box, (0, 0, canvas.width, canvas.height))
         clip = self.clip_px(e)
-        if clip:
-            mask = Image.new("L", canvas.size, 0)
-            ImageDraw.Draw(mask).rectangle([clip[0], clip[1], clip[2] - 1, clip[3] - 1], fill=255)
-            layer.putalpha(ImageChops.multiply(layer.getchannel("A"), mask))
-        canvas.alpha_composite(layer)
+        vis = vis and (_intersect(vis, clip) if clip else vis)
+        if not vis:
+            return
+        x0, y0 = vis[0], vis[1]
+        size = (vis[2] - x0, vis[3] - y0)
+        local = [(x - x0, y - y0) for x, y in quad]
+        alpha = e.get("alpha", 1)
+        f = ln.get("file")
+        if f or ln.get("atlas"):
+            # The strip's coordinates: s along the line from its top-left corner, r down across it. Only the part
+            # of the strip the visible window can show is drawn, through the matching texture coordinates.
+            tx, ty = local[0]
+            ss = [(x - tx) * ux + (y - ty) * uy for x in (0, size[0]) for y in (0, size[1])]
+            rs = [-(x - tx) * nx - (y - ty) * ny for x in (0, size[0]) for y in (0, size[1])]
+            s0, s1 = max(0.0, min(ss)), min(length, max(ss))
+            r0, r1 = max(0.0, min(rs)), min(t, max(rs))
+            if s1 <= s0 or r1 <= r0:
+                return
+            corners = _tex_corners(ln.get("coords"))
+            a, b, c, d = s0 / length, s1 / length, r0 / t, r1 / t
+            sub = [*_bilerp(corners, a, c), *_bilerp(corners, a, d), *_bilerp(corners, b, c), *_bilerp(corners, b, d)]
+            sw, sh = max(1, round(s1 - s0)), max(1, round(r1 - r0))
+            tex = {
+                "file": f if isinstance(f, str) else None,
+                "fileID": f if isinstance(f, int | float) else None,
+                "atlas": ln.get("atlas"),
+                "coords": sub,
+            }
+            strip = self.texture_image(tex, sw, sh, e["path"])
+            strip = _extend(_extend(strip, -2, sw + 2, "CLAMP", 0), -2, sh + 2, "CLAMP", 1)
+            # Output pixel (x, y) -> strip pixel.
+            kx, ky = sw / (s1 - s0), sh / (r1 - r0)
+            data = (
+                ux * kx,
+                uy * kx,
+                -(tx * ux + ty * uy + s0) * kx + 2,
+                -nx * ky,
+                -ny * ky,
+                (tx * nx + ty * ny - r0) * ky + 2,
+            )
+            img = strip.transform(
+                size, Image.Transform.AFFINE, tuple(round(v, 6) for v in data), Image.Resampling.BILINEAR
+            )
+            img = _tint(img, ln.get("vertex"), alpha)
+        else:
+            color = ln.get("color") or [1, 1, 1, 1]
+            vertex = ln.get("vertex") or [1, 1, 1, 1]
+            img = Image.new("RGBA", size, _rgba([color[i] * vertex[i] for i in range(4)], alpha))
+        img.putalpha(ImageChops.multiply(img.getchannel("A"), _coverage(size, local)))
+        self.paste(canvas, img, x0, y0, clip)
 
     def render(self, doc: dict, crop: str = "window") -> tuple[Image.Image, tuple]:
         sw, sh = doc["screen"]
@@ -939,9 +1229,9 @@ def cmd_files(a):
             tex = e.get("texture") or {}
             for f in (
                 tex.get("file"),
+                (e.get("line") or {}).get("file"),
                 (e.get("backdrop") or {}).get("bgFile"),
                 (e.get("backdrop") or {}).get("edgeFile"),
-                (e.get("line") or {}).get("file"),
             ):
                 if isinstance(f, str) and f:
                     paths.add(f)

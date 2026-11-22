@@ -1581,7 +1581,7 @@ def test_parse_documentation_file():
     assert apidoc.parse_documentation("local X = f(1, 2)\nlocal Z = 1 + 2\n" + tail) == [{"Name": "a"}]
 
 
-def _cli(*argv) -> tuple[int, str, str]:
+def _wowui(*argv) -> tuple[int, str, str]:
     import contextlib
     import io
 
@@ -1592,7 +1592,7 @@ def _cli(*argv) -> tuple[int, str, str]:
 
 
 def _api(docs_dir: Path, *args: str) -> tuple[int, str, str]:
-    return _cli("api", "--docs", docs_dir, *args)
+    return _wowui("api", "--docs", docs_dir, *args)
 
 
 def test_api_lookups():
@@ -1729,7 +1729,7 @@ def test_api_cache():
         # Written through a temporary file, and used again for the same client without reading its storage.
         assert apidoc._write_cache(cache, sig, docs) is None
         assert [p.name for p in cache.parent.iterdir()] == ["api.json"]
-        code, out, _ = _cli(*ask)
+        code, out, _ = _wowui(*ask)
         assert code == 0 and out.startswith("C_Map.GetBountySetMaps(")
 
         # A cache for another client, an old format, a corrupt file or one of the wrong shape is not used: the client's
@@ -1745,7 +1745,7 @@ def test_api_cache():
         ):
             stale()
             assert apidoc._read_cache(cache, sig) is None
-            code, _, err = _cli(*ask)
+            code, _, err = _wowui(*ask)
             assert code == 2 and "CASC storage" in err and "Traceback" not in err, err
 
         # A cache that cannot be written is a message, not a crash.
@@ -1754,12 +1754,12 @@ def test_api_cache():
         assert "not written" in apidoc._write_cache(blocker / "api.json", sig, docs)
 
         # No .build.info, no storage: exit code 2 with the reason.
-        code, _, err = _cli("api", "C_Map", "--game", root / "nothing")
+        code, _, err = _wowui("api", "C_Map", "--game", root / "nothing")
         assert code == 2 and "CASC storage" in err
 
         # The game folder is only read: a cache in it, or beside the .build.info above it, is refused.
         for inside in (game / "api.json", game.parent / "api.json", game / "sub" / "api.json"):
-            code, _, err = _cli("api", "C_Map", "--game", game, "--cache", inside)
+            code, _, err = _wowui("api", "C_Map", "--game", game, "--cache", inside)
             assert code == 2 and "only read" in err, err
             assert not inside.exists()
         assert not (game / "sub").exists(), "nothing is created in the game folder"
@@ -1774,11 +1774,11 @@ def test_api_usage_errors():
     with tempfile.TemporaryDirectory() as tmp:
         d = Path(tmp)
         (d / "MapDocumentation.lua").write_text(MAP_DOC, encoding="utf-8")
-        code, _, err = _cli("api", "--docs", d)
+        code, _, err = _wowui("api", "--docs", d)
         assert code == 2 and "needs a name" in err
-        code, _, err = _cli("api", "C_Map")
+        code, _, err = _wowui("api", "C_Map")
         assert code == 2 and "--game" in err and "--docs" in err
-        code, _, err = _cli("api", "C_Map", "--docs", d, "--cache", d / "x" / "cache.json")
+        code, _, err = _wowui("api", "C_Map", "--docs", d, "--cache", d / "x" / "cache.json")
         assert code == 0 and "--cache applies to --game only" in err and not (d / "x").exists()
 
 

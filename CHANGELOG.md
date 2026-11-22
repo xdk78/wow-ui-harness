@@ -22,6 +22,10 @@
   `GetItemInfoInstant` / `C_Item.GetItemInfoInstant` stubs (fill `mock.items`), replacements of `GetCursorPosition`,
   `IsMouseButtonDown` and `IsShiftKeyDown` in tests (`mock.WithInput`), hand-run `OnMouseDown` / `OnDragStart` /
   `OnUpdate` / `OnDragStop` / `OnMouseUp` sequences (`mock.Drag`), and `MenuUtil` fakes.
+- `wowui check` (`python/check.py`, standard library only): a static safety lint of an addon's Lua source, configured by
+  `.wowui-check.json` in the addon repository. Rules: `forbidden-call`, `combat-log`, `new-global`, `file-length`,
+  `test-shell-find`, `unguarded-registration`, `suppression-reason`; `-- wowui-check: ignore <rule> <reason>`
+  suppressions; text or JSON output; exit code 1 on findings, 2 on a config error.
 
 ## [0.2.0] - 2026-11-16
 

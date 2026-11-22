@@ -6,6 +6,9 @@ See a World of Warcraft addon's UI without playing the game by hand. Version 0.2
   client does (anchors, sizes, scales, scroll frames, text with the real fonts), dumps the frame tree of chosen views as
   JSON, lints it (truncated, clipped or overlapping text, overlapping buttons, things outside the window, missing
   glyphs) and renders it to PNG with the game's own textures, atlases and fonts read from a local install.
+- **Static (Python, standard library):** `wowui check` scans an addon's Lua source for unsafe or forbidden patterns
+  (forbidden calls, combat log registration, new globals, unguarded registrations...), configured by a small JSON
+  file in the addon's repository: see [Static safety check](#static-safety-check).
 - **In game:** `LibUIShots-1.0`, an embeddable library that walks an addon's views one by one and takes a screenshot
   of each, with a manifest that says which file shows what.
 
@@ -163,6 +166,112 @@ uv run --script $H/python/wowui.py render  --game "$G" --dump <work>/dump --out 
 With a window, only that window's tree is linted. `uv run --script python/wowui.py lint --dump <dir> --baseline <file>`
 prints the same findings from Python.
 
+## Static safety check
+
+`wowui check` scans an addon's Lua source for unsafe or forbidden patterns without the game and without the mock: a
+tokenizer that skips strings and comments (long brackets included) plus enough scope tracking to tell a local from a
+global. Python standard library only, and `git` when the folder is a git working tree (it lists files with
+`git ls-files`; without git it walks the folder).
+
+```sh
+uv run --script <harness>/python/wowui.py check [--config FILE] [--root DIR] [--format text|json] [paths...]
+uv run --script <harness>/python/check.py       [same options]     # the same, without installing Pillow
+```
+
+Output is one finding per line, `path:line: rule-id: message` (repo-relative paths with `/`, sorted), then a summary
+line. Exit code 0: no unsuppressed finding; 1: findings; 2: a config or usage error. `--format json` prints
+`{"findings": [{path, line, rule, message}], "summary": {files, findings, suppressed}}`. `paths` limit the check to
+files or folders; the config's `include` / `exclude` still apply.
+
+### Config
+
+`.wowui-check.json` in the root (or `--config FILE`; an explicit file that does not exist is an error, a missing
+default file means the built-in defaults). Unknown keys and wrong types are errors (exit 2), so a typo cannot silently
+turn a rule off; keys starting with `_` are ignored (use them for notes: JSON has no comments). Everything is optional:
+
+```json
+{
+  "include": ["**/*.lua"],
+  "exclude": ["Libs/**", "Data/Generated/**"],
+  "disable": { "tests/**": ["new-global", "file-length"] },
+  "rules": {
+    "forbidden-call": {
+      "calls": ["OpenWorldMap", "SetCVar", "SetBinding", "SetBindingClick", "SaveBindings", "loadstring", "load", "RunScript"],
+      "hookTargets": ["WorldMapFrame", "PlayerFrame", "TargetFrame", "FocusFrame", "GameMenuFrame"]
+    },
+    "combat-log": { "events": ["COMBAT_LOG_EVENT", "COMBAT_LOG_EVENT_UNFILTERED"] },
+    "new-global": { "allow": ["MyAddon", "MyAddonDB", "SLASH_MYADDON%d+", "BINDING_*"] },
+    "file-length": { "maxLines": 800, "overrides": { "Data/**": 5000 } },
+    "test-shell-find": { "tests": ["tests/**"] },
+    "unguarded-registration": { "guard": "MyAddon:CanRegister" },
+    "suppression-reason": true
+  }
+}
+```
+
+- `include` / `exclude`: globs over repo-relative paths. `**` is any depth, `*` and `?` stay within one path segment, a
+  pattern without `/` matches the file name at any depth, a trailing `/` means everything below. Defaults: include
+  `**/*.lua`, exclude `Libs/**` and `libs/**` (vendored libraries).
+- `disable`: glob to a list of rule ids that are off for the matching files.
+- `rules.<id>`: `false` turns a rule off, `true` keeps its defaults, an object sets its parameters (and may carry
+  `"enabled": false`). The defaults shown above are starting points, not a statement of what every addon must avoid:
+  an addon replaces any list in its config. Setting `calls` or `hookTargets` replaces the default list; `calls` may
+  also be an object mapping a name to the reason shown in the message.
+
+### Rules
+
+| Rule | Finds |
+|---|---|
+| `forbidden-call` | a call to a name in `calls` (a plain global such as `SetCVar` or `load`, also `_G.SetCVar(...)`, or a dotted name such as `C_CVar.SetCVar`; a local variable of the same name is not the global). Also `hooksecurefunc(Target, ...)` where Target is a string or the first name of the first argument and is in `hookTargets` (`hooksecurefunc(WorldMapFrame, ...)`, `hooksecurefunc("SomeGlobalFunc", ...)`, `hooksecurefunc(WorldMapFrame.ScrollContainer, ...)`), and `Frame:HookScript(...)` / `Frame.child:HookScript(...)` where Frame is in `hookTargets`. Add `hooksecurefunc` to `calls` to forbid it altogether. |
+| `combat-log` | `x:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")` and the other `events` (also AceEvent's `self:RegisterEvent(...)`); only a string literal first argument can be seen |
+| `new-global` | an assignment to a name that is not a local and not in `allow`: `Foo = ...`, `function Foo()`, `function Foo.bar()` / `function Foo:bar()` (defines a member of global `Foo`), `_G.Foo = ...`, `_G["Foo"] = ...`, `function _G.Foo()`. Field assignments such as `Foo.bar = 1` are not checked. `_G[name] = ...` with a computed key cannot be seen. |
+| `file-length` | a file over `maxLines` lines (default 1000; `overrides` maps globs to other limits, first match wins); reported at line 1 |
+| `test-shell-find` | a test file (`tests`, default `tests/**`) whose `io.popen` / `os.execute` runs `find`, `dir` or `ls`: on Windows `find` is `find.exe`, a text search, so such a test passes vacuously; use `git ls-files` |
+| `unguarded-registration` | a registration that is not guarded (below): `tinsert(UISpecialFrames, ...)`, `table.insert(UISpecialFrames, ...)`, `UISpecialFrames[...] = ...`, a slash command variable `SLASH_X1 = ...` (also `_G["SLASH_X1"] = ...`), `SlashCmdList[...] = ...`, `SlashCmdList.X = ...`. Off when `guard` (a call such as `MyAddon:CanRegister`, or a list of them) is not set. |
+| `suppression-reason` | a suppression comment without a reason |
+
+**Guarded** means: the statement is lexically inside an `if` / `elseif` branch whose condition calls the guard (not
+negated: the branch of `if not guard() then` runs when the guard said no), or an enclosing function (or the file's top
+level) calls the guard earlier in the text, or an earlier `if` of the enclosing function has the guard in its condition
+and a first branch that starts with `return` (`if not guard() then return end`: the guard was consulted and the rest of
+the function runs under its answer). A guard call inside another function, or after the statement, does not count;
+a guard call in an `if` condition without such a `return` guards only that `if`. Calls are matched by their written
+name (`:` and `.` are the same), so `local g = MyAddon.CanRegister; g()` is not recognised.
+
+**Limits.** The tokenizer follows Lua 5.1 (no `goto`, no integer division). Scope tracking is a heuristic, not a
+parser: a `local` counts from its declaration to the end of its block, `if` branches have separate scopes, and a
+`local x = function() x = 1 end` treats `x` as local inside the function (Lua treats it as global there). Aliases
+(`local f = SetCVar; f()`), calls through `pcall(SetCVar, ...)`, computed names and `loadstring`-ed code are not seen.
+A file Lua cannot parse is scanned as far as the tokenizer gets; the check never fails on a syntax error.
+
+### Suppressions
+
+An inline comment on the same line or the line above a finding:
+
+```lua
+-- wowui-check: ignore new-global the client calls this by name
+function MyAddon_OnCompartmentClick() end
+SetCVar("foo", 1) -- wowui-check: ignore forbidden-call set once on first run, with the user's consent
+```
+
+The reason after the rule id is required: without one the finding is still suppressed, but the comment itself is a
+`suppression-reason` finding. A suppression of a rule that has no finding there does nothing. Use `disable` in the
+config for whole paths, and put the line-1 comment for `file-length`.
+
+### In CI
+
+It needs only Python and git, no game and no Lua. A GitHub Actions step with [setup-uv](https://github.com/astral-sh/setup-uv):
+
+```yaml
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Static safety check
+        run: uv run --script path/to/wow-ui-harness/python/check.py
+```
+
+`check.py` has no dependencies (`wowui.py check` is the same code, run by a script that also installs Pillow). Run it
+from the addon's folder or pass `--root`.
+
 ## In game: LibUIShots-1.0
 
 Embed it like any LibStub library (`Libs/LibUIShots-1.0/LibUIShots-1.0.xml` in your `embeds.xml`, after LibStub and,
@@ -226,7 +335,7 @@ vscode-wow-api project and the wowless headless client.
 ## Repository
 
 - `lua/wowui/` the Lua package (`mock`, `layout`, `text`, `ttf`, `dump`, `lint`, `runner`, `json`)
-- `python/` the command line (`wowui.py`) and its game readers (`casc.py`, `db2.py`)
+- `python/` the command line (`wowui.py`), its game readers (`casc.py`, `db2.py`) and the static check (`check.py`)
 - `lib/LibUIShots-1.0/` the in-game library
 - `examples/` a tiny addon and its dump script; `tests/` Lua tests (`lua tests/run.lua`) and Python tests
   (`uv run --script tests/test_cli.py`); `docs/` the dump format

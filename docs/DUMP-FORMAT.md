@@ -7,7 +7,7 @@ down (the client uses bottom-left; the dump converts). A rect is `[x, y, width, 
 ```jsonc
 {
   "schema": "wowui-dump/1",
-  "harness": "0.2.0",              // wowui.mock's version
+  "harness": "0.3.0",              // wowui.mock's version
   "view": "home",                  // the view's name (with the runner's --prefix, e.g. "plPL/home")
   "meta": { ... },                 // whatever the caller passed; a sequence step (wowui.views) adds sequence, step, steps, caption
   "screen": [1920, 1080],          // UIParent's size

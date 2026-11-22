@@ -45,6 +45,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageFont
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+import apidoc  # noqa: E402
 import casc as casc_mod  # noqa: E402
 import check as check_mod  # noqa: E402
 import db2  # noqa: E402
@@ -1402,6 +1403,9 @@ def main(argv=None):
     check_mod.add_arguments(p)
     p.set_defaults(fn=check_mod.run)
     visual.add_commands(sub)
+    p = sub.add_parser("api", help="look a function, event, enum or structure up in the client's API documentation")
+    apidoc.add_arguments(p)
+    p.set_defaults(fn=apidoc.run)
     a = ap.parse_args(argv)
     return a.fn(a) or 0
 

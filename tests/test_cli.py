@@ -30,6 +30,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "python"))
 
+import apidoc  # noqa: E402
 import casc  # noqa: E402
 import check  # noqa: E402
 import db2  # noqa: E402
@@ -1377,6 +1378,448 @@ def test_example_sequence_to_gif():
             ["compare", str(tmp / "png" / "seq-example-02.png"), str(tmp / "png" / "seq-example-03.png")]
         )
         assert code == 1 and "pixels changed" in out
+
+
+MAP_DOC = """\
+-- A documentation table in the shape the client's addon uses (synthetic).
+local Map =
+{
+	Name = "MapUI",
+	Type = "System",
+	Namespace = "C_Map",
+	Environment = "All",
+
+	Functions =
+	{
+		{
+			Name = "GetMapInfo",
+			Type = "Function",
+			MayReturnNothing = true,
+			Documentation = { "Returns details about a map.", "Second line." },
+
+			Arguments =
+			{
+				{ Name = "uiMapID", Type = "number", Nilable = false },
+				{ Name = "flags", Type = "UIMapFlag", Nilable = true, Default = 0, Documentation = { "Optional." } },
+			},
+
+			Returns =
+			{
+				{ Name = "info", Type = "UiMapDetails", Nilable = true },
+			},
+		},
+		{
+			Name = "GetBountySetMaps",
+			Type = "Function",
+			Arguments =
+			{
+				{ Name = "bountySetID", Type = "number", Nilable = false },
+			},
+			Returns =
+			{
+				{ Name = "mapIDs", Type = "table", InnerType = "number", Nilable = false },
+			},
+		},
+		{
+			Name = "InCombatLockdown",
+			Type = "Function",
+			Namespace = "",
+			Returns = { { Name = "inLockdown", Type = "bool", Nilable = false } },
+		},
+	},
+
+	Events =
+	{
+		{
+			Name = "PlayerMapChanged",
+			Type = "Event",
+			LiteralName = "PLAYER_MAP_CHANGED",
+			SynchronousEvent = true,
+			Payload =
+			{
+				{ Name = "oldMapID", Type = "number", Nilable = false },
+				{ Name = "newMapID", Type = "number", Nilable = false },
+			},
+		},
+	},
+
+	Tables =
+	{
+		{
+			Name = "UIMapType",
+			Type = "Enumeration",
+			NumValues = 2,
+			MinValue = 0,
+			MaxValue = 1,
+			Fields =
+			{
+				{ Name = "Cosmic", Type = "UIMapType", EnumValue = 0 },
+				{ Name = "World", Type = "UIMapType", EnumValue = 1 },
+			},
+		},
+		{
+			Name = "UiMapDetails",
+			Type = "Structure",
+			Documentation = { "What a map is." },
+			Fields =
+			{
+				{ Name = "mapID", Type = "number", Nilable = false },
+				{ Name = "mapType", Type = "UIMapType", Nilable = false },
+			},
+		},
+		{
+			Name = "MapConstants",
+			Type = "Constants",
+			Values =
+			{
+				{ Name = "MaxZoom", Type = "number", Value = 4 },
+				{ Name = "FirstType", Type = "UIMapType", Value = Enum.UIMapType.Cosmic },
+			},
+		},
+	},
+
+	Predicates =
+	{
+	},
+};
+
+APIDocumentation:AddDocumentationTable(Map);
+"""
+
+COMMENTATOR_DOC = """\
+local Commentator =
+{
+	Name = "CommentatorFrame",
+	Type = "System",
+	Namespace = "C_Commentator",
+	Functions =
+	{
+		{
+			Name = "GetMapInfo",
+			Type = "Function",
+			Returns = { { Name = "teamSize", Type = "number", Nilable = false } },
+		},
+	},
+	Events = {},
+	Tables = {},
+};
+
+APIDocumentation:AddDocumentationTable(Commentator);
+"""
+
+OBJECT_DOC = """\
+local SimpleFrameAPI =
+{
+	Name = "SimpleFrameAPI",
+	Type = "ScriptObject",
+	Functions =
+	{
+		{ Name = "SetAlpha", Type = "Function", Arguments = { { Name = "alpha", Type = "number", Nilable = false } } },
+	},
+	Events = {},
+	Tables = {},
+};
+
+APIDocumentation:AddDocumentationTable(SimpleFrameAPI);
+"""
+
+
+def test_lua_literal_parser():
+    parse = apidoc.parse_value
+    assert parse("{ 1, 2.5, -3, 0x10, 1e3, true, false, nil }") == [1, 2.5, -3, 16, 1000.0, True, False, None]
+    assert parse('{ a = "x", ["b c"] = { 1, { 2 } }, 7, }') == {"a": "x", "b c": [1, [2]], 1: 7}
+    # Comments, line and block, with and without levels; semicolons as separators.
+    assert parse("{ 1, -- one\n 2; --[[ block\n comment ]] 3, --[==[ x ]] y ]==] 4 }") == [1, 2, 3, 4]
+    # Strings: escapes, long brackets (the first newline is dropped, the contents are raw), decimal bytes as UTF-8.
+    assert parse(r"""{ 'it\'s', "tab\there", "nl\nx", "\65\x42", "\226\128\148" }""") == [
+        "it's",
+        "tab\there",
+        "nl\nx",
+        "AB",
+        "—",
+    ]
+    assert parse("{ [[\nline one\n\\n raw]], [==[a]]b]==] }") == ["line one\n\\n raw", "a]]b"]
+    # Expressions that are not literals keep their text.
+    assert parse("{ Enum.A.B, 1 + 2, f(1, 2), x = Constants.Y - 1 }") == {
+        1: {"expr": "Enum.A.B"},
+        2: {"expr": "1 + 2"},
+        3: {"expr": "f(1, 2)"},
+        "x": {"expr": "Constants.Y - 1"},
+    }
+    # The expression's text ends with its last token: a trailing comment is not part of it.
+    assert parse("{ x = Enum.A.B -- note\n, y = 1 }") == {"x": {"expr": "Enum.A.B"}, "y": 1}
+    # A backslash before a line break is a newline in a string, CRLF and LFCR included.
+    assert parse('{ "a\\\r\nb", "c\\\n\rd", "e\\\nf" }') == ["a\nb", "c\nd", "e\nf"]
+    # Mixed positional and keyed entries (positional ones are numbered from 1), ';' as separator, trailing ';'.
+    assert parse("{ 1, a = 2, 3; }") == {"a": 2, 1: 1, 2: 3}
+    assert parse("{ 1; 2; }") == [1, 2]
+    # A key that is not a plain value: an expression is keyed by its text; a table as key drops the entry.
+    assert parse("{ [Enum.X] = 1, [{}] = 2, [{ 1 }] = 3, ok = 4 }") == {"Enum.X": 1, "ok": 4}
+    # Nesting is limited (the file is skipped with a message, no RecursionError).
+    nested, levels = parse("{" * 50 + "}" * 50), 0
+    while nested:
+        nested, levels = nested[0], levels + 1
+    assert levels == 49
+    for bad in ("{ 1, 2", '{ "unfinished }', "{ a = }", "{ 1 2 }", "{" * 5000, "{ [Enum.X] = }"):
+        try:
+            parse(bad)
+        except apidoc.LuaError:
+            continue
+        raise AssertionError(f"{bad[:20]!r} parsed")
+
+
+def test_parse_documentation_file():
+    docs = apidoc.parse_documentation(MAP_DOC + COMMENTATOR_DOC)
+    assert [d["Name"] for d in docs] == ["MapUI", "CommentatorFrame"]
+    assert docs[0]["Functions"][0]["Documentation"] == ["Returns details about a map.", "Second line."]
+    assert docs[0]["Tables"][2]["Values"][1]["Value"] == {"expr": "Enum.UIMapType.Cosmic"}
+    # Nothing is executed: a call that is not AddDocumentationTable is skipped, not run.
+    assert apidoc.parse_documentation('error("boom")\nlocal x = 1\n') == []
+    # An expression the parser keeps as text ends at the next statement (`local X = Foo` does not swallow the rest).
+    tail = "local Y = { Name = 'a' }\nAPIDocumentation:AddDocumentationTable(Y)\n"
+    assert apidoc.parse_documentation("local X = Foo.Bar\n" + tail) == [{"Name": "a"}]
+    assert apidoc.parse_documentation("local X = f(1, 2)\nlocal Z = 1 + 2\n" + tail) == [{"Name": "a"}]
+
+
+def _wowui(*argv) -> tuple[int, str, str]:
+    import contextlib
+    import io
+
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = wowui.main([str(a) for a in argv])
+    return code, out.getvalue(), err.getvalue()
+
+
+def _api(docs_dir: Path, *args: str) -> tuple[int, str, str]:
+    return _wowui("api", "--docs", docs_dir, *args)
+
+
+def test_api_lookups():
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        (d / "MapDocumentation.lua").write_text(MAP_DOC, encoding="utf-8")
+        (d / "CommentatorDocumentation.lua").write_text(COMMENTATOR_DOC, encoding="utf-8")
+        (d / "SimpleFrameAPIDocumentation.lua").write_text(OBJECT_DOC, encoding="utf-8")
+
+        code, out, _ = _api(d, "C_Map.GetMapInfo")
+        assert code == 0
+        lines = out.splitlines()
+        assert lines[0] == "C_Map.GetMapInfo(uiMapID: number, flags: UIMapFlag? = 0) -> info: UiMapDetails?", lines[0]
+        assert "MayReturnNothing: true" in lines[1] and "function in MapUI" in lines[1]
+        assert lines[2:4] == ["  Returns details about a map.", "  Second line."]
+        assert any(x.startswith("  flags") and "nilable; default 0; Optional." in x for x in lines)
+        assert out.index("Arguments:") < out.index("Returns:")
+
+        # The short name is unique here (after the namespace one is asked for by its full name).
+        code, out, _ = _api(d, "GetBountySetMaps")
+        assert code == 0 and out.startswith("C_Map.GetBountySetMaps(bountySetID: number) -> mapIDs: table<number>")
+        # A function that names its own (empty) namespace is a global.
+        code, out, _ = _api(d, "InCombatLockdown")
+        assert code == 0 and out.startswith("InCombatLockdown() -> inLockdown: bool")
+
+        # Ambiguity lists the full names and has its own exit code; the full name settles it.
+        code, out, _ = _api(d, "GetMapInfo")
+        assert code == 3
+        assert "C_Commentator.GetMapInfo" in out and "C_Map.GetMapInfo" in out
+        code, out, _ = _api(d, "c_commentator.getmapinfo")
+        assert code == 0 and out.startswith("C_Commentator.GetMapInfo() -> teamSize: number")
+
+        # A whole namespace.
+        code, out, _ = _api(d, "C_Map")
+        assert code == 0 and out.splitlines()[0].startswith("C_Map  (namespace")
+        for name in (
+            "C_Map.GetMapInfo",
+            "PLAYER_MAP_CHANGED",
+            "Enum.UIMapType",
+            "UiMapDetails",
+            "Constants.MapConstants",
+        ):
+            assert name in out, name
+
+        # An event by its literal name (and by its CamelCase name), an enum with and without "Enum.".
+        code, out, _ = _api(d, "PLAYER_MAP_CHANGED")
+        assert code == 0 and out.splitlines()[0] == "PLAYER_MAP_CHANGED(oldMapID: number, newMapID: number)"
+        assert _api(d, "PlayerMapChanged")[1] == out
+        code, out, _ = _api(d, "Enum.UIMapType")
+        assert code == 0 and "Cosmic  = 0" in out and "World   = 1" in out
+        assert _api(d, "UIMapType")[1] == out
+
+        # A structure, a constants table (its non-literal value keeps its text), a script object's method.
+        code, out, _ = _api(d, "UiMapDetails")
+        assert code == 0 and "mapType  UIMapType" in out and "What a map is." in out
+        code, out, _ = _api(d, "Constants.MapConstants")
+        assert code == 0 and "FirstType  UIMapType  = Enum.UIMapType.Cosmic" in out
+        code, out, _ = _api(d, "SimpleFrameAPI:SetAlpha")
+        assert code == 0 and out.startswith("SimpleFrameAPI:SetAlpha(alpha: number)")
+        code, out, _ = _api(d, "SimpleFrameAPI")
+        assert code == 0 and "script object" in out.splitlines()[0]
+
+        # --expand adds the structures and enumerations an entry refers to, and those they refer to.
+        code, out, _ = _api(d, "C_Map.GetMapInfo", "--expand")
+        assert code == 0 and "\nEnum.UIMapType\n" in out and "\nUiMapDetails\n" in out
+        assert out.index("Enum.UIMapType") < out.index(
+            "\nUiMapDetails\n"
+        )  # enums sort before structures; no duplicates
+        assert out.count("\nEnum.UIMapType\n") == 1
+
+        # --search lists matches of every kind, in a fixed order.
+        code, out, _ = _api(d, "--search", "map")
+        assert code == 0
+        names = [line.split()[1].split("(")[0] for line in out.splitlines()]
+        assert names == [
+            "C_Commentator.GetMapInfo",
+            "C_Map.GetBountySetMaps",
+            "C_Map.GetMapInfo",
+            "PLAYER_MAP_CHANGED",
+            "Enum.UIMapType",
+            "UiMapDetails",
+            "Constants.MapConstants",
+        ], names
+
+        # Nothing found.
+        code, out, err = _api(d, "C_Map.NoSuchThing")
+        assert code == 1 and out == "" and "nothing named 'C_Map.NoSuchThing'" in err
+        assert _api(d, "--search", "zzzz")[0] == 1
+
+
+def test_api_json():
+    import json
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        (d / "MapDocumentation.lua").write_text(MAP_DOC, encoding="utf-8")
+        code, out, _ = _api(d, "C_Map.GetMapInfo", "--json", "--expand")
+        doc = json.loads(out)
+        assert code == 0 and doc["kind"] == "function" and doc["name"] == "C_Map.GetMapInfo" and doc["group"] == "C_Map"
+        assert doc["arguments"][1] == {
+            "name": "flags",
+            "type": "UIMapFlag",
+            "nilable": True,
+            "default": 0,
+            "documentation": ["Optional."],
+        }
+        assert [e["name"] for e in doc["expanded"]] == ["Enum.UIMapType", "UiMapDetails"]
+        code, out, _ = _api(d, "C_Map", "--json")
+        group = json.loads(out)
+        assert code == 0 and group["kind"] == "group" and len(group["entries"]) == 6
+        code, out, _ = _api(d, "--search", "UIMapType", "--json")
+        assert [e["name"] for e in json.loads(out)] == ["Enum.UIMapType"]
+
+
+def _fake_game(root: Path) -> Path:
+    """A folder with a .build.info above it and no CASC storage: enough for the cache rules, not for reading."""
+    game = root / "client" / "_retail_"
+    game.mkdir(parents=True)
+    (root / "client" / ".build.info").write_text("Branch!STRING:0\nus\n", encoding="utf-8")
+    return game
+
+
+def test_api_cache():
+    import json
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        game = _fake_game(root)
+        cache = root / "cache" / "api.json"
+        docs = apidoc.parse_documentation(MAP_DOC)
+        sig = apidoc.game_signature(game)
+        ask = ("api", "C_Map.GetBountySetMaps", "--game", game, "--cache", cache)
+
+        # Written through a temporary file, and used again for the same client without reading its storage.
+        assert apidoc._write_cache(cache, sig, docs) is None
+        assert [p.name for p in cache.parent.iterdir()] == ["api.json"]
+        code, out, _ = _wowui(*ask)
+        assert code == 0 and out.startswith("C_Map.GetBountySetMaps(")
+
+        # A cache for another client, an old format, a corrupt file or one of the wrong shape is not used: the client's
+        # storage is read instead (the fake one cannot be, which says so with exit code 2 and no traceback).
+        for stale in (
+            lambda: apidoc._write_cache(cache, "game:another", docs),
+            lambda: cache.write_text(
+                json.dumps({"schema": "wowui-api-cache/0", "signature": sig, "docs": []}), "utf-8"
+            ),
+            lambda: cache.write_text("{ not json", "utf-8"),
+            lambda: cache.write_text("[1, 2]", "utf-8"),
+            lambda: cache.write_text(json.dumps({"schema": apidoc.CACHE_SCHEMA}), "utf-8"),
+        ):
+            stale()
+            assert apidoc._read_cache(cache, sig) is None
+            code, _, err = _wowui(*ask)
+            assert code == 2 and "CASC storage" in err and "Traceback" not in err, err
+
+        # A cache that cannot be written is a message, not a crash.
+        blocker = root / "blocker"
+        blocker.write_text("a file where a folder is needed", encoding="utf-8")
+        assert "not written" in apidoc._write_cache(blocker / "api.json", sig, docs)
+
+        # No .build.info, no storage: exit code 2 with the reason.
+        code, _, err = _wowui("api", "C_Map", "--game", root / "nothing")
+        assert code == 2 and "CASC storage" in err
+
+        # The game folder is only read: a cache in it, or beside the .build.info above it, is refused.
+        for inside in (game / "api.json", game.parent / "api.json", game / "sub" / "api.json"):
+            code, _, err = _wowui("api", "C_Map", "--game", game, "--cache", inside)
+            assert code == 2 and "only read" in err, err
+            assert not inside.exists()
+        assert not (game / "sub").exists(), "nothing is created in the game folder"
+
+        # A complete read is what the cache keeps: nothing found, or a warning, is not frozen into it.
+        assert not apidoc.Source([], sig, []).complete
+        assert not apidoc.Source(docs, sig, ["3 listed files are not in this install"]).complete
+        assert apidoc.Source(docs, sig, []).complete
+
+
+def test_api_usage_errors():
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        (d / "MapDocumentation.lua").write_text(MAP_DOC, encoding="utf-8")
+        code, _, err = _wowui("api", "--docs", d)
+        assert code == 2 and "needs a name" in err
+        code, _, err = _wowui("api", "C_Map")
+        assert code == 2 and "--game" in err and "--docs" in err
+        code, _, err = _wowui("api", "C_Map", "--docs", d, "--cache", d / "x" / "cache.json")
+        assert code == 0 and "--cache applies to --game only" in err and not (d / "x").exists()
+
+
+def test_api_same_entry_in_two_files_is_not_ambiguous():
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        (d / "MapDocumentation.lua").write_text(MAP_DOC, encoding="utf-8")
+        (d / "CommentatorDocumentation.lua").write_text(COMMENTATOR_DOC, encoding="utf-8")
+        (d / "CommentatorAgainDocumentation.lua").write_text(COMMENTATOR_DOC, encoding="utf-8")
+        code, out, _ = _api(d, "GetMapInfo")
+        assert code == 3 and out.count("C_Commentator.GetMapInfo") == 1 and out.count("C_Map.GetMapInfo") == 1
+        code, out, _ = _api(d, "C_Commentator.GetMapInfo")
+        assert code == 0
+        # The same name with a different definition stays ambiguous.
+        (d / "CommentatorAgainDocumentation.lua").write_text(
+            COMMENTATOR_DOC.replace("teamSize", "size"), encoding="utf-8"
+        )
+        code, out, _ = _api(d, "C_Commentator.GetMapInfo")
+        assert code == 3 and out.count("\n  function ") == 2
+
+
+def test_api_without_documentation():
+    with tempfile.TemporaryDirectory() as tmp:
+        empty = Path(tmp)
+        code, _, err = _api(empty, "C_Map")
+        assert code == 2 and "Blizzard_APIDocumentationGenerated" in err and "--docs" in err
+        # A source checkout works too: the addon's folder is found below the folder given.
+        addon = empty / "Interface" / "AddOns" / "Blizzard_APIDocumentationGenerated"
+        addon.mkdir(parents=True)
+        (addon / "MapDocumentation.lua").write_text(MAP_DOC, encoding="utf-8")
+        assert _api(empty, "C_Map.GetMapInfo")[0] == 0
+        # A file the parser cannot read is reported and skipped; the rest still answers.
+        (addon / "BrokenDocumentation.lua").write_text("local X = { Name = ", encoding="utf-8")
+        code, _, err = _api(empty, "C_Map.GetMapInfo")
+        assert code == 0 and "BrokenDocumentation.lua" in err
+        # Table keys that are not plain values and absurd nesting cost that file only, never the run.
+        (addon / "KeysDocumentation.lua").write_text("local X = { [Enum.A] = 1, [{}] = 2 }\n", encoding="utf-8")
+        (addon / "DeepDocumentation.lua").write_text("local X = " + "{" * 5000, encoding="utf-8")
+        code, _, err = _api(empty, "C_Map.GetMapInfo")
+        assert code == 0 and "DeepDocumentation.lua" in err and "deeper than" in err and "Traceback" not in err
+        assert "KeysDocumentation.lua" not in err
 
 
 def main():

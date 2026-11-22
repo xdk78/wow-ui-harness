@@ -52,6 +52,9 @@
   `--labels`, `--tolerance` and `--threshold`; exit code 1 when they differ.
 - `wowui atlases --search <text>` and `--sheet <png>` (`--filter`, `--columns`, `--cell`, `--max`): find atlases by name
   and draw a labelled contact sheet from the client's textures. `--out` is optional now.
+- `wowui api`: offline API lookup. Prints a function's, namespace's, event's, enumeration's or structure's signature,
+  arguments and returns from the API documentation the client ships (`Blizzard_APIDocumentationGenerated`, read from its
+  CASC storage or from `--docs <folder>`; the tables are parsed, not run). `--search`, `--expand`, `--json`, `--cache`.
 
 ## [0.2.0] - 2026-11-16
 

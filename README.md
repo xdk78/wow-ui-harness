@@ -18,6 +18,7 @@ Built for addon developers and for coding agents that need to look at a UI they 
 |---|---|---|
 | Mock, layout, dump, lint, runner | `lua/wowui/` | Lua 5.1 |
 | Renderer, lint reader, game data, GIFs, image compare | `python/wowui.py` (`casc.py`, `db2.py`, `visual.py`) | Python 3.15+ through [uv](https://docs.astral.sh/uv/), which fetches it, a local game install for textures |
+| API lookup (`wowui api`) | `python/apidoc.py` | Python, a local game install or a copy of the documentation files |
 | Screenshot library | `lib/LibUIShots-1.0/` | the game, LibStub (CallbackHandler-1.0 optional) |
 
 ## Offline: dump, lint, render
@@ -431,6 +432,41 @@ It needs only Python and git, no game and no Lua. A GitHub Actions step with [se
 `check.py` has no dependencies (`wowui.py check` is the same code, run by a script that also installs Pillow). Run it
 from the addon's folder or pass `--root`.
 
+## Offline API lookup
+
+`wowui api` prints a function's, namespace's, event's, enumeration's or structure's signature, arguments (type,
+nilable, default) and returns from the API documentation the client itself ships (the load-on-demand addon
+`Blizzard_APIDocumentationGenerated`), read from the client's CASC storage. The documentation files are Blizzard's:
+they are read from your own client at run time and never copied into this repository. Nothing is written to the game
+folder.
+
+```sh
+W="uv run --script $H/python/wowui.py api --game $G"
+$W C_Map.GetMapInfo              # C_Map.GetMapInfo(uiMapID: number) -> info: UiMapDetails, then the argument and return tables
+$W GetMapInfo                    # a short name: every namespace that has one is listed (exit code 3) when it is ambiguous
+$W C_Map                         # a namespace (or a script object such as SimpleFrameAPI): every function, event and table in it
+$W PLAYER_MAP_CHANGED            # an event, by its literal name (or its CamelCase name)
+$W Enum.UIMapType                # an enumeration (also UIMapType), with its values; structures by name: UiMapDetails
+$W C_Map.GetMapInfo --expand     # plus the structures and enumerations it refers to, recursively
+$W --search waypoint             # every function, event and table whose name contains the text
+$W C_Item.GetItemInfoInstant --json   # the documentation entry as JSON (camelCase keys)
+```
+
+- Functions, script-object methods (`SimpleFrameAPI:SetAlpha`), events, enumerations (`Enum.X`), structures, callback
+  types and constants tables (`Constants.X`) are indexed. The docs' own flags (`MayReturnNothing`, `SecretArguments`...)
+  print on the second line; a value the docs compute (`Enum.X.Y`, `a + 1`) prints as its source text.
+- Exit codes: 0 found, 1 nothing found, 2 no documentation to read, 3 the name fits several entries (they are listed).
+- The tables are Lua table constructors. They are parsed, never run (`python/apidoc.py`), so Python is all it needs.
+  A file that does not parse is reported on stderr and skipped.
+- A client that does not ship the addon (older flavours) exits with code 2 and says so. `--docs <folder>` reads a copy
+  of the documentation `.lua` files instead (for example the addon's folder from a checkout of
+  [wow-ui-source](https://github.com/Gethe/wow-ui-source), or the folder that holds `Interface/AddOns`); it needs no
+  client, so it also works in CI.
+- `--cache <file>` keeps the parsed documentation as JSON (keep it outside the game folder), keyed to the client's
+  `.build.info` (a patch changes it, and the cache is rebuilt), so repeated lookups skip reading CASC (about 2.5 s).
+- The documentation lists what the client's C API takes and returns. Lua-side code (for example `MenuUtil`) is not in
+  it: look at the client's own addon files for that.
+
 ## In game: LibUIShots-1.0
 
 Embed it like any LibStub library (`Libs/LibUIShots-1.0/LibUIShots-1.0.xml` in your `embeds.xml`, after LibStub and,
@@ -512,7 +548,7 @@ vscode-wow-api project and the wowless headless client.
 
 - `lua/wowui/` the Lua package (`mock`, `layout`, `text`, `ttf`, `dump`, `lint`, `runner`, `views`, `json`, `perf`)
 - `python/` the command line (`wowui.py`), its visual tools (`visual.py`: `gif`, `compare`, atlas sheets), its game
-  readers (`casc.py`, `db2.py`) and the static check (`check.py`)
+  readers (`casc.py`, `db2.py`), the static check (`check.py`) and the API lookup (`apidoc.py`)
 - `lib/LibUIShots-1.0/` the in-game library
 - `examples/` a tiny addon and its dump script; `tests/` Lua tests (`lua tests/run.lua`) and Python tests
   (`uv run --script tests/test_cli.py`); `docs/` the dump format

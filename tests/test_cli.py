@@ -11,6 +11,7 @@ Needs `lua` (5.1) on PATH: it dumps the example addon first, then renders and li
 
 from __future__ import annotations
 
+import io
 import json
 import math
 import os

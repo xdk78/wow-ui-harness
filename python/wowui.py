@@ -1232,7 +1232,6 @@ def cmd_files(a):
                 (e.get("line") or {}).get("file"),
                 (e.get("backdrop") or {}).get("bgFile"),
                 (e.get("backdrop") or {}).get("edgeFile"),
-                (e.get("line") or {}).get("file"),
             ):
                 if isinstance(f, str) and f:
                     paths.add(f)

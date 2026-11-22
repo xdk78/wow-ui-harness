@@ -64,6 +64,111 @@ local function lookup(o)
 	return o
 end
 
+-- Script handlers, as the client keeps them: one handler per script (SetScript, or the first HookScript on a script
+-- that has none) and the hooks added after it, run in the order they were added. SetScript drops the hooks.
+local function hasScript(f, name)
+	return (f._scripts and f._scripts[name]) or (f._hooks and f._hooks[name]) or nil
+end
+
+-- Run a frame's script the way the client does: the handler, then every hook with the same arguments. Returns the
+-- handler's results. `M.FireScript(button, "OnClick", "LeftButton", false)`.
+function M.FireScript(f, name, ...)
+	local fn = f._scripts and f._scripts[name]
+	local hooks = f._hooks and f._hooks[name]
+	if not hooks then
+		if fn then
+			return fn(f, ...)
+		end
+		return
+	end
+	local r = fn and { fn(f, ...) } or {}
+	for _, hook in ipairs(hooks) do
+		hook(f, ...)
+	end
+	return unpack(r)
+end
+local fireScript = M.FireScript
+
+-- The frame tree, for OnShow / OnHide: every object's children in the order they were parented.
+local function addChild(p, f)
+	if type(p) == "table" then
+		local kids = rawget(p, "_children")
+		if not kids then
+			kids = {}
+			rawset(p, "_children", kids)
+		end
+		kids[#kids + 1] = f
+	end
+end
+
+local function removeChild(p, f)
+	local kids = type(p) == "table" and rawget(p, "_children")
+	for i, k in ipairs(kids or {}) do
+		if k == f then
+			table.remove(kids, i)
+			return
+		end
+	end
+end
+
+-- Shown with every ancestor shown: what the client calls visible (IsVisible), whether or not layout is enabled.
+local function visible(f)
+	local guard = 0
+	while f and guard < 200 do
+		if f._shown == false then
+			return false
+		end
+		f = f._parent
+		guard = guard + 1
+	end
+	return true
+end
+
+-- OnShow / OnHide for a frame that became visible / hidden and for each of its descendants that is shown itself
+-- (so it changed visibility with it), parent first.
+local function fireTree(f, name)
+	if hasScript(f, name) then
+		fireScript(f, name)
+	end
+	local kids = rawget(f, "_children")
+	if kids then
+		local copy = { unpack(kids) } -- a handler may reparent or create frames
+		for _, k in ipairs(copy) do
+			if k._shown ~= false and k._parent == f then
+				fireTree(k, name)
+			end
+		end
+	end
+end
+
+-- The size OnSizeChanged compares: the resolved one with wowui.layout, else the size set (0 when none).
+local function sizeNow(f)
+	if M.layout then
+		return f:GetWidth() or 0, f:GetHeight() or 0
+	end
+	return f._w or 0, f._h or 0
+end
+
+-- After SetSize / SetWidth / SetHeight: OnSizeChanged(self, width, height) when the size really changed, as the client
+-- does (it fires when it next resolves the frame; the mock fires at once). Not re-entered for the same frame from its
+-- own handler; wowui.layout.SettleSizes picks up sizes that changed through anchors.
+local function sizeChanged(f, ow, oh)
+	if f._inSizeChanged or not hasScript(f, "OnSizeChanged") then
+		return
+	end
+	local w, h = sizeNow(f)
+	if math.abs(w - ow) <= 0.01 and math.abs(h - oh) <= 0.01 then
+		return
+	end
+	f._settledSize = { w, h }
+	f._inSizeChanged = true
+	local ok, err = pcall(fireScript, f, "OnSizeChanged", w, h)
+	f._inSizeChanged = nil
+	if not ok then
+		error(err, 0)
+	end
+end
+
 -- Methods with meaningful return values or recorded state. Everything else returns nil.
 local DEFAULTS
 DEFAULTS = {
@@ -77,16 +182,25 @@ DEFAULTS = {
 		return self._w or 400, self._h or 300
 	end,
 	SetWidth = function(self, w)
-		self._w = w
-		touch()
+		DEFAULTS._resize(self, w, self._h)
 	end,
 	SetHeight = function(self, h)
-		self._h = h
-		touch()
+		DEFAULTS._resize(self, self._w, h)
 	end,
 	SetSize = function(self, w, h)
+		DEFAULTS._resize(self, w, h)
+	end,
+	_resize = function(self, w, h)
+		local watch = not self._inSizeChanged and hasScript(self, "OnSizeChanged")
+		local ow, oh
+		if watch then
+			ow, oh = sizeNow(self)
+		end
 		self._w, self._h = w, h
 		touch()
+		if watch then
+			sizeChanged(self, ow, oh)
+		end
 	end,
 	GetLeft = function()
 		return 0
@@ -125,6 +239,29 @@ DEFAULTS = {
 	GetStringHeight = function()
 		return 14
 	end,
+	-- Whether the text is cut with "...": only for a font string given a width (SetWidth / SetSize; without
+	-- wowui.layout anchors are not resolved), measured at the mock's 6 units a character and 14 a line. The lines
+	-- allowed are MaxLines and what the set height holds; without either, wrapped text grows and is not cut.
+	-- wowui.layout replaces this with the real measurement.
+	IsTruncated = function(self)
+		local w = self._w
+		if not w or w <= 0 then
+			return false
+		end
+		local need = DEFAULTS.GetUnboundedStringWidth(self)
+		if need <= w + 0.5 then
+			return false
+		end
+		if self._wordWrap == false then
+			return true
+		end
+		local lines = (self._maxLines or 0) > 0 and self._maxLines or nil
+		if self._h and self._h > 0 then
+			local fit = math.max(1, math.floor(self._h / 14))
+			lines = lines and math.min(lines, fit) or fit
+		end
+		return lines ~= nil and need > w * lines + 0.5
+	end,
 	GetLineHeight = function()
 		return 14
 	end,
@@ -162,21 +299,27 @@ DEFAULTS = {
 	GetVerticalScrollRange = function()
 		return 0
 	end,
+	-- As in the client: OnShow when the frame becomes visible (its parents are shown), then for each descendant that
+	-- became visible with it; Show on a shown frame does nothing. Hide mirrors it with OnHide.
 	Show = function(self)
+		if self._shown ~= false then
+			return
+		end
 		self._shown = true
 		touch()
-		local fn = self._scripts and self._scripts.OnShow
-		if fn then
-			fn(self)
+		if visible(self) then
+			fireTree(self, "OnShow")
 		end
 	end,
 	Hide = function(self)
-		local was = self._shown
+		if self._shown == false then
+			return
+		end
+		local was = visible(self)
 		self._shown = false
 		touch()
-		local fn = self._scripts and self._scripts.OnHide
-		if fn and was then
-			fn(self)
+		if was then
+			fireTree(self, "OnHide")
 		end
 	end,
 	SetShown = function(self, v)
@@ -192,22 +335,29 @@ DEFAULTS = {
 	IsVisible = function(self)
 		return self._shown ~= false
 	end,
+	-- SetScript replaces the handler and drops the script's hooks; HookScript on a script without a handler sets it (as
+	-- the client has done since 3.0.8), otherwise adds a hook that runs after the handler and earlier hooks. GetScript
+	-- returns the handler only. mock.FireScript runs handler and hooks.
 	SetScript = function(self, name, fn)
 		self._scripts = self._scripts or {}
 		self._scripts[name] = fn
+		if self._hooks then
+			self._hooks[name] = nil
+		end
 	end,
 	GetScript = function(self, name)
 		return self._scripts and self._scripts[name]
 	end,
 	HookScript = function(self, name, fn)
 		self._scripts = self._scripts or {}
-		local old = self._scripts[name]
-		self._scripts[name] = function(...)
-			if old then
-				old(...)
-			end
-			return fn(...)
+		if not self._scripts[name] then
+			self._scripts[name] = fn
+			return
 		end
+		self._hooks = self._hooks or {}
+		local list = self._hooks[name] or {}
+		self._hooks[name] = list
+		list[#list + 1] = fn
 	end,
 	HasScript = function()
 		return true
@@ -233,9 +383,21 @@ DEFAULTS = {
 	GetParent = function(self)
 		return self._parent
 	end,
+	-- Reparenting can change visibility: OnShow / OnHide fire as for Show and Hide.
 	SetParent = function(self, p)
-		self._parent = lookup(p)
+		p = lookup(p)
+		if p == self._parent then
+			return
+		end
+		local was = visible(self)
+		removeChild(self._parent, self)
+		self._parent = p
+		addChild(p, self)
 		touch()
+		local now = visible(self)
+		if was ~= now then
+			fireTree(self, now and "OnShow" or "OnHide")
+		end
 	end,
 	GetObjectType = function(self)
 		return self._type
@@ -450,11 +612,20 @@ DEFAULTS = {
 	GetRegions = function()
 		return nil
 	end,
-	IsMouseOver = function()
-		return false
+	-- True while the frame is hovered with mock.Hover (until mock.Leave).
+	IsMouseOver = function(self)
+		return self._hovered or false
 	end,
 	EnableMouse = function(self, v)
 		self._mouse = v and true or false
+	end,
+	-- Which clicks a button takes ("LeftButtonUp", "AnyUp", ...; the client's default is "LeftButtonUp") and which
+	-- buttons start a drag: recorded, and honoured by mock.Click and mock.Drag.
+	RegisterForClicks = function(self, ...)
+		self._clicks = { ... }
+	end,
+	RegisterForDrag = function(self, ...)
+		self._drag = { ... }
 	end,
 	SetMouseClickEnabled = function(self, v)
 		self._mouseClick = v and true or false
@@ -462,8 +633,10 @@ DEFAULTS = {
 	SetMouseMotionEnabled = function(self, v)
 		self._mouseMotion = v and true or false
 	end,
-	IsMouseEnabled = function()
-		return true
+	-- As last set with EnableMouse (true until then; wowui.layout answers false until then, as the client does for
+	-- frames).
+	IsMouseEnabled = function(self)
+		return self._mouse ~= false
 	end,
 	SetClipsChildren = function(self, v)
 		self._clips = v and true or false
@@ -857,6 +1030,7 @@ function M.CreateFrame(kind, name, parent, template)
 	local f = setmetatable({ _type = kind, _name = name, _parent = lookup(parent), _shown = true, _template = template,
 		_order = #frames + 1 }, mt)
 	frames[#frames + 1] = f
+	addChild(f._parent, f)
 	if name then
 		_G[name] = f
 	end
@@ -871,37 +1045,227 @@ end
 -- Fire a game event at every frame registered for it (AceEvent, AceAddon, the addon's own).
 function M.FireEvent(event, ...)
 	for _, f in ipairs(frames) do
-		if f._events and f._events[event] and f._scripts and f._scripts.OnEvent then
-			f._scripts.OnEvent(f, event, ...)
+		if f._events and f._events[event] and hasScript(f, "OnEvent") then
+			fireScript(f, "OnEvent", event, ...)
 		end
 	end
 end
 
--- Run due timers (C_Timer) and OnUpdate scripts once.
-function M.Advance(seconds)
+-- One frame of `seconds`: OnUpdate(self, elapsed) for every visible frame (the client runs OnUpdate only for visible
+-- frames), then the C_Timer callbacks due by then, earliest first. A timer created by a callback runs on a later frame,
+-- and a ticker fires at most once a frame, as in the client.
+local timerSeq = 0
+local function frameStep(seconds)
 	M.now = M.now + seconds
-	-- One frame of OnUpdate for every shown frame (ChatThrottleLib sends its queue from OnUpdate).
 	for _, f in ipairs(frames) do
-		local fn = f._scripts and f._scripts.OnUpdate
-		if fn and f._shown ~= false then
-			fn(f, seconds)
+		if hasScript(f, "OnUpdate") and visible(f) then
+			fireScript(f, "OnUpdate", seconds)
 		end
 	end
-	local due = M.timers
-	M.timers = {}
+	local due, keep = {}, {}
+	for _, t in ipairs(M.timers) do
+		if not t.cancelled then
+			if t.at <= M.now + 1e-9 then
+				due[#due + 1] = t
+			else
+				keep[#keep + 1] = t
+			end
+		end
+	end
+	M.timers = keep
+	table.sort(due, function(a, b)
+		if a.at ~= b.at then
+			return a.at < b.at
+		end
+		return (a.seq or 0) < (b.seq or 0)
+	end)
 	for _, t in ipairs(due) do
-		if t.at <= M.now then
-			if not t.cancelled then
-				t.fn(t.handle)
-				if t.every and not t.cancelled then
-					t.at = M.now + t.every
-					M.timers[#M.timers + 1] = t
+		if not t.cancelled then
+			t.fn(t.handle)
+			if t.left then -- a ticker with a number of iterations
+				t.left = t.left - 1
+				if t.left <= 0 then
+					t.cancelled = true
 				end
 			end
-		else
-			M.timers[#M.timers + 1] = t
+			if t.every and not t.cancelled then
+				t.at = M.now + t.every
+				M.timers[#M.timers + 1] = t
+			end
 		end
 	end
+end
+
+-- Advance time by `seconds` as one frame, or as frames of `step` seconds each: `mock.Advance(2, 0.1)` runs 20 frames.
+function M.Advance(seconds, step)
+	if not step or step <= 0 or step >= seconds then
+		frameStep(seconds)
+		return
+	end
+	local left = seconds
+	while left > 1e-9 do
+		local dt = math.min(step, left)
+		frameStep(dt)
+		left = left - dt
+	end
+end
+
+-- Input the tests drive: the cursor (GetCursorPosition), held mouse buttons (IsMouseButtonDown) and held keys
+-- (IsShiftKeyDown, IsControlKeyDown, IsAltKeyDown, IsModifierKeyDown, IsKeyDown...). Keys are the client's names:
+-- "LSHIFT", "RSHIFT", "LCTRL", "RCTRL", "LALT", "RALT", "LMETA", "RMETA", letters; "SHIFT", "CTRL", "ALT" and "META"
+-- mean the left one.
+M.input = { x = 0, y = 0, buttons = {}, keys = {} }
+
+local KEY_ALIAS = { SHIFT = "LSHIFT", CTRL = "LCTRL", ALT = "LALT", META = "LMETA" }
+local BUTTON_ALIAS = { [1] = "LeftButton", [2] = "RightButton", [3] = "MiddleButton", [4] = "Button4", [5] = "Button5" }
+
+function M.SetCursor(x, y)
+	M.input.x, M.input.y = x, y
+end
+
+function M.SetMouseButtonDown(button, down)
+	M.input.buttons[BUTTON_ALIAS[button] or button or "LeftButton"] = down ~= false or nil
+end
+
+function M.SetKeyDown(key, down)
+	key = tostring(key):upper()
+	M.input.keys[KEY_ALIAS[key] or key] = down ~= false or nil
+end
+
+function M.ResetInput()
+	M.input = { x = 0, y = 0, buttons = {}, keys = {} }
+end
+
+-- Run fn with this input, then put the previous input back (also when fn fails). `state`: { cursor = { x, y },
+-- keys = { "SHIFT", ... }, buttons = { "LeftButton", ... } }. Returns fn's results.
+function M.WithInput(state, fn, ...)
+	local saved = M.input
+	M.input = { x = saved.x, y = saved.y, buttons = {}, keys = {} }
+	for k, v in pairs(saved.buttons) do
+		M.input.buttons[k] = v
+	end
+	for k, v in pairs(saved.keys) do
+		M.input.keys[k] = v
+	end
+	if state.cursor then
+		M.SetCursor(state.cursor[1], state.cursor[2])
+	end
+	for _, k in ipairs(state.keys or {}) do
+		M.SetKeyDown(k, true)
+	end
+	for _, b in ipairs(state.buttons or {}) do
+		M.SetMouseButtonDown(b, true)
+	end
+	local r = { pcall(fn, ...) }
+	M.input = saved
+	if not r[1] then
+		error(r[2], 0)
+	end
+	return unpack(r, 2)
+end
+
+local function keyDown(...)
+	for i = 1, select("#", ...) do
+		if M.input.keys[(select(i, ...))] then
+			return true
+		end
+	end
+	return false
+end
+
+local function clickRegistered(f, button, dir)
+	local list = rawget(f, "_clicks") or { "LeftButtonUp" }
+	for _, c in ipairs(list) do
+		if c == button .. dir or c == "Any" .. dir then
+			return true
+		end
+	end
+	return false
+end
+
+local function runIf(f, name, ...)
+	if hasScript(f, name) then
+		return fireScript(f, name, ...)
+	end
+end
+
+local function click(f, button, down)
+	if f._type ~= "Button" and f._type ~= "CheckButton" then
+		return false
+	end
+	if f._enabled == false or not clickRegistered(f, button, down and "Down" or "Up") then
+		return false
+	end
+	if f._type == "CheckButton" then
+		f._checked = not f._checked
+	end
+	runIf(f, "PreClick", button, down)
+	runIf(f, "OnClick", button, down)
+	runIf(f, "PostClick", button, down)
+	return true
+end
+
+-- A click as the client delivers it: OnMouseDown, (OnClick if registered for the down stroke), OnMouseUp, then
+-- PreClick / OnClick / PostClick for a button registered for that click (RegisterForClicks; default "LeftButtonUp")
+-- and enabled. A check button toggles before OnClick. Returns whether OnClick ran.
+function M.Click(f, button)
+	button = button or "LeftButton"
+	M.SetMouseButtonDown(button, true)
+	runIf(f, "OnMouseDown", button)
+	local clicked = click(f, button, true)
+	M.SetMouseButtonDown(button, false)
+	runIf(f, "OnMouseUp", button, true)
+	return click(f, button, false) or clicked
+end
+
+-- A drag: the cursor at `from`, the button down (OnMouseDown), the cursor moves to `to` in `steps` frames; after the
+-- first move OnDragStart (only for a frame registered for that button with RegisterForDrag, as in the client), and
+-- each frame is a mock.Advance(elapsed) (OnUpdate, timers); at the end OnDragStop and OnMouseUp, the button released.
+-- opts: { from = { x, y }, to = { x, y }, steps = 1, button = "LeftButton", elapsed = 1 / 60 }.
+function M.Drag(f, opts)
+	opts = opts or {}
+	local button = opts.button or "LeftButton"
+	local from = opts.from or { M.input.x, M.input.y }
+	local to = opts.to or from
+	local steps = math.max(1, opts.steps or 1)
+	local dt = opts.elapsed or (1 / 60)
+	local drags = false
+	for _, b in ipairs(rawget(f, "_drag") or {}) do
+		if b == button or b == "AnyButton" then
+			drags = true
+		end
+	end
+	M.SetCursor(from[1], from[2])
+	M.SetMouseButtonDown(button, true)
+	runIf(f, "OnMouseDown", button)
+	for i = 1, steps do
+		M.SetCursor(from[1] + (to[1] - from[1]) * i / steps, from[2] + (to[2] - from[2]) * i / steps)
+		if i == 1 and drags then
+			runIf(f, "OnDragStart", button)
+		end
+		M.Advance(dt)
+	end
+	if drags then
+		runIf(f, "OnDragStop")
+	end
+	M.SetMouseButtonDown(button, false)
+	runIf(f, "OnMouseUp", button, true)
+end
+
+-- The pointer enters / leaves a frame: OnEnter(self, true) / OnLeave(self, true); IsMouseOver answers in between.
+function M.Hover(f)
+	f._hovered = true
+	runIf(f, "OnEnter", true)
+end
+
+function M.Leave(f)
+	f._hovered = nil
+	runIf(f, "OnLeave", true)
+end
+
+-- The mouse wheel over a frame: OnMouseWheel(self, delta) (1 up, -1 down).
+function M.Wheel(f, delta)
+	runIf(f, "OnMouseWheel", delta or 1)
 end
 
 -- WoW ships Lua BitOp as `bit`; plain Lua 5.1 does not. A small arithmetic version for the libraries that use it.
@@ -953,6 +1317,408 @@ bitlib = {
 	end,
 }
 M.bit = bitlib
+
+-- Menus, as Blizzard_Menu (11.0 and later) builds them: MenuUtil.CreateContextMenu(owner, generator, ...) calls
+-- generator(owner, rootDescription, ...); descriptions have the client's element API (CreateButton, CreateCheckbox,
+-- CreateRadio, CreateTitle, CreateDivider, CreateSpacer, CreateTemplate, CreateColorSwatch; SetEnabled with a boolean
+-- or a predicate that gets the description, SetCanSelect, SetResponse, SetTooltip, Queue*...) and Pick works as the
+-- client's: nothing for a disabled or unselectable element; the responder gets (data, menuInputData, menu); its
+-- response (else the element's default: Refresh for checkboxes) decides whether the menu closes (nil and CloseAll
+-- close it, Close closes the level it is on). The returned menu (also mock.lastMenu) has test helpers: Find, Click,
+-- Lines, IsOpen. Nothing is drawn.
+local MENU_RESPONSE = { Open = 1, Refresh = 2, Close = 3, CloseAll = 4 }
+local MENU_INPUT = { None = 1, MouseButton = 2, MouseWheel = 3 }
+M.MenuResponse, M.MenuInputContext = MENU_RESPONSE, MENU_INPUT
+
+local Desc = {}
+local descMT = {
+	__index = function(_, k)
+		local fn = Desc[k]
+		if fn then
+			return fn
+		end
+		if type(k) == "string" and k:match("^%u") then
+			return noop
+		end
+		return nil
+	end,
+}
+
+local function newDesc(kind, text, data)
+	local d = setmetatable({ kind = kind, text = text, data = data, elements = {} }, descMT)
+	d.items = d.elements -- the name earlier versions of the mock used
+	return d
+end
+
+function Desc:Insert(d, index)
+	for _, q in ipairs(self._queued or {}) do
+		q._parentDesc = self
+		self.elements[#self.elements + 1] = q
+	end
+	self._queued = nil
+	d._parentDesc = self
+	if index then
+		table.insert(self.elements, index, d)
+	else
+		self.elements[#self.elements + 1] = d
+	end
+	return d
+end
+
+local function button(text, callback, data)
+	local d = newDesc("button", text, data)
+	d.responder, d.fn = callback, callback
+	return d
+end
+
+local function selection(kind, text, isSelected, setSelected, data)
+	local d = newDesc(kind, text, data)
+	d.isSelected, d.responder, d.setSelected = isSelected, setSelected, setSelected
+	if kind == "checkbox" then
+		d.defaultResponse = MENU_RESPONSE.Refresh
+	end
+	return d
+end
+
+-- Standalone creators (MenuUtil.CreateButton...), and the same as methods that insert into a description.
+local CREATE = {
+	CreateButton = button,
+	CreateHighlightButton = function(text, data, onEnter)
+		local d = button(text, nil, data)
+		d.onEnter = onEnter
+		return d
+	end,
+	CreateCheckbox = function(text, isSelected, setSelected, data)
+		return selection("checkbox", text, isSelected, setSelected, data)
+	end,
+	CreateRadio = function(text, isSelected, setSelected, data)
+		return selection("radio", text, isSelected, setSelected, data)
+	end,
+	CreateHighlightRadio = function(text, isSelected, setSelected, data, onEnter)
+		local d = selection("radio", text, isSelected, setSelected, data)
+		d.onEnter = onEnter
+		return d
+	end,
+	CreateTitle = function(text, color)
+		local d = newDesc("title", text)
+		d.color = color
+		return d
+	end,
+	CreateDivider = function()
+		return newDesc("divider")
+	end,
+	CreateSpacer = function(extent)
+		local d = newDesc("spacer")
+		d.extent = extent
+		return d
+	end,
+	CreateFrame = function()
+		return newDesc("frame")
+	end,
+	CreateTemplate = function(template)
+		local d = newDesc("template")
+		d.template = template
+		return d
+	end,
+	CreateColorSwatch = function(text, callback, colorInfo)
+		local d = button(text, callback, colorInfo)
+		d.kind = "colorswatch"
+		return d
+	end,
+}
+for name, create in pairs(CREATE) do
+	Desc[name] = function(self, ...)
+		return self:Insert(create(...))
+	end
+end
+
+function Desc:QueueTitle(text, color)
+	self._queued = self._queued or {}
+	self._queued[#self._queued + 1] = CREATE.CreateTitle(text, color)
+end
+function Desc:QueueDivider()
+	self._queued = self._queued or {}
+	self._queued[#self._queued + 1] = CREATE.CreateDivider()
+end
+function Desc:QueueSpacer(extent)
+	self._queued = self._queued or {}
+	self._queued[#self._queued + 1] = CREATE.CreateSpacer(extent)
+end
+function Desc:ClearQueuedDescriptions()
+	self._queued = nil
+end
+
+function Desc:SetEnabled(isEnabled)
+	self.isEnabled = isEnabled
+end
+function Desc:IsEnabled()
+	if self.isEnabled == nil then
+		return true
+	elseif type(self.isEnabled) == "boolean" then
+		return self.isEnabled
+	end
+	return self.isEnabled(self)
+end
+function Desc:ShouldPollEnabled()
+	return type(self.isEnabled) == "function"
+end
+function Desc:SetCanSelect(canSelect)
+	self.canSelect = canSelect
+end
+function Desc:CanSelect()
+	if not self:IsEnabled() then
+		return false
+	elseif self.canSelect == nil then
+		return true
+	elseif type(self.canSelect) == "boolean" then
+		return self.canSelect
+	end
+	return self.canSelect(self.data)
+end
+function Desc:SetIsSelected(isSelected)
+	self.isSelected = isSelected
+end
+function Desc:IsSelected()
+	if self.isSelected == nil then
+		return false
+	end
+	return self.isSelected(self.data)
+end
+function Desc:SetRadio(v)
+	self.kind = v and "radio" or self.kind
+end
+function Desc:IsRadio()
+	return self.kind == "radio"
+end
+function Desc:SetCheckbox(v)
+	self.kind = v and "checkbox" or self.kind
+end
+function Desc:IsCheckbox()
+	return self.kind == "checkbox"
+end
+function Desc:SetData(data)
+	self.data = data
+end
+function Desc:GetData()
+	return self.data
+end
+function Desc:SetResponder(callback)
+	self.responder, self.fn = callback, callback
+end
+function Desc:HasResponder()
+	return self.responder ~= nil
+end
+function Desc:HookResponder(callback)
+	local old = self.responder
+	if not old then
+		self:SetResponder(callback)
+		return
+	end
+	self:SetResponder(function(...)
+		local r = old(...)
+		callback(...)
+		return r
+	end)
+end
+function Desc:SetResponse(response)
+	self.defaultResponse = response
+end
+function Desc:GetDefaultResponse(context, buttonName)
+	if type(self.defaultResponse) == "function" then
+		return self.defaultResponse(context, buttonName)
+	end
+	return self.defaultResponse
+end
+function Desc:SetOnEnter(fn)
+	self.onEnter = fn
+end
+function Desc:GetOnEnter()
+	return self.onEnter
+end
+function Desc:SetOnLeave(fn)
+	self.onLeave = fn
+end
+function Desc:GetOnLeave()
+	return self.onLeave
+end
+function Desc:SetTooltip(initializer)
+	self.tooltip = initializer or true
+end
+function Desc:SetTitleAndTextTooltip(title, text)
+	self.tooltip = { title, text }
+end
+function Desc:HasElements()
+	return #self.elements > 0
+end
+function Desc:EnumerateElementDescriptions()
+	return ipairs(self.elements)
+end
+function Desc:AddInitializer(fn)
+	self.initializers = self.initializers or {}
+	self.initializers[#self.initializers + 1] = fn
+end
+
+local function menuOf(d)
+	local guard = 0
+	while d and guard < 100 do
+		if d.menu then
+			return d.menu
+		end
+		d = d._parentDesc
+		guard = guard + 1
+	end
+	return nil
+end
+
+-- The client's MenuElementDescriptionProxyMixin:Pick.
+function Desc:Pick(context, buttonName)
+	if not self:CanSelect() then
+		return false
+	end
+	if not self:HasResponder() then
+		return false
+	end
+	local menu = menuOf(self)
+	local response = self:GetDefaultResponse(context, buttonName)
+	local override = self.responder(self.data, { context = context, buttonName = buttonName }, menu)
+	if override then
+		response = override
+	end
+	if menu then
+		menu:_respond(self, response)
+	end
+	return true, response
+end
+
+local Menu = {}
+local menuMT = { __index = function(_, k)
+	local fn = Menu[k]
+	if fn then
+		return fn
+	end
+	if type(k) == "string" and k:match("^%u") then
+		return noop
+	end
+	return nil
+end }
+
+function Menu:_respond(d, response)
+	self.lastResponse = response
+	if response == nil or response == MENU_RESPONSE.CloseAll then
+		if not d:HasElements() then
+			self:Close()
+		end
+	elseif response == MENU_RESPONSE.Close then
+		if d._parentDesc == self.root then
+			self:Close()
+		end
+	elseif response == MENU_RESPONSE.Refresh then
+		self.refreshes = self.refreshes + 1
+	end
+end
+
+function Menu:IsOpen()
+	return self.open
+end
+
+function Menu:Close()
+	if self.open then
+		self.open = false
+		if self.onClosed then
+			self.onClosed()
+		end
+	end
+end
+
+function Menu:SetClosedCallback(fn)
+	self.onClosed = fn
+end
+
+-- The element at a path of texts ("Sort", "By name": a submenu's entry) or the first, depth first, whose text is the
+-- given one (markup is compared as is).
+function Menu:Find(...)
+	local n = select("#", ...)
+	if n > 1 then
+		local d = self.root
+		for i = 1, n do
+			local want = select(i, ...)
+			local found
+			for _, e in ipairs(d.elements) do
+				if e.text == want then
+					found = e
+					break
+				end
+			end
+			if not found then
+				return nil
+			end
+			d = found
+		end
+		return d
+	end
+	local want = ...
+	local function walk(d)
+		for _, e in ipairs(d.elements) do
+			if e.text == want then
+				return e
+			end
+			local hit = walk(e)
+			if hit then
+				return hit
+			end
+		end
+		return nil
+	end
+	return walk(self.root)
+end
+
+-- Click an element (a description or the texts Find takes): Pick with the mouse button. Errors when there is no such
+-- element or the menu was closed; returns Pick's results (false when the element is disabled).
+function Menu:Click(...)
+	local d = ...
+	if type(d) ~= "table" then
+		d = self:Find(...)
+	end
+	if not d then
+		error("menu has no element " .. table.concat({ ... }, " > "), 2)
+	end
+	if not self.open then
+		error("the menu is closed", 2)
+	end
+	return d:Pick(MENU_INPUT.MouseButton, "LeftButton")
+end
+
+-- The menu as text lines, one per element, indented by level: "button Delete", "radio [x] Small",
+-- "checkbox [ ] Show", "title Options", "divider", with " (disabled)" for disabled ones. For assertions and logs.
+function Menu:Lines()
+	local out = {}
+	local function walk(d, depth)
+		for _, e in ipairs(d.elements) do
+			local s = string.rep("  ", depth) .. e.kind
+			if e.kind == "checkbox" or e.kind == "radio" then
+				s = s .. (e:IsSelected() and " [x]" or " [ ]")
+			end
+			if e.text then
+				s = s .. " " .. tostring(e.text)
+			end
+			if not e:IsEnabled() then
+				s = s .. " (disabled)"
+			end
+			out[#out + 1] = s
+			walk(e, depth + 1)
+		end
+	end
+	walk(self.root, 0)
+	return out
+end
+
+local function openMenu(owner, root)
+	local menu = setmetatable({ owner = owner, root = root, open = true, refreshes = 0 }, menuMT)
+	menu.items = root.elements -- earlier versions of the mock returned the root with its items
+	root.menu = menu
+	M.lastMenu = menu
+	return menu
+end
 
 -- Install the generic client API into _G. Game data stubs (maps, journal, instances, ...) are the addon's to add.
 function M.Install()
@@ -1069,8 +1835,56 @@ function M.Install()
 	_G.IsLoggedIn = function()
 		return M.loggedIn or false
 	end
+	-- Input (mock.SetCursor, mock.SetKeyDown, mock.SetMouseButtonDown, mock.WithInput). The client's GetCursorPosition
+	-- is in screen pixels (addons divide by UIParent:GetEffectiveScale()); the mock returns what was set.
 	_G.GetCursorPosition = function()
-		return 0, 0
+		return M.input.x, M.input.y
+	end
+	_G.IsMouseButtonDown = function(button)
+		if button == nil then
+			return next(M.input.buttons) ~= nil
+		end
+		return M.input.buttons[BUTTON_ALIAS[button] or button] or false
+	end
+	_G.IsShiftKeyDown = function()
+		return keyDown("LSHIFT", "RSHIFT") or M.shiftDown or false
+	end
+	_G.IsLeftShiftKeyDown = function()
+		return keyDown("LSHIFT")
+	end
+	_G.IsRightShiftKeyDown = function()
+		return keyDown("RSHIFT")
+	end
+	_G.IsControlKeyDown = function()
+		return keyDown("LCTRL", "RCTRL")
+	end
+	_G.IsLeftControlKeyDown = function()
+		return keyDown("LCTRL")
+	end
+	_G.IsRightControlKeyDown = function()
+		return keyDown("RCTRL")
+	end
+	_G.IsAltKeyDown = function()
+		return keyDown("LALT", "RALT")
+	end
+	_G.IsLeftAltKeyDown = function()
+		return keyDown("LALT")
+	end
+	_G.IsRightAltKeyDown = function()
+		return keyDown("RALT")
+	end
+	_G.IsMetaKeyDown = function()
+		return keyDown("LMETA", "RMETA")
+	end
+	_G.IsModifierKeyDown = function()
+		return _G.IsShiftKeyDown() or _G.IsControlKeyDown() or _G.IsAltKeyDown() or _G.IsMetaKeyDown()
+	end
+	_G.IsKeyDown = function(key)
+		key = tostring(key):upper()
+		if KEY_ALIAS[key] then
+			return keyDown("L" .. key, "R" .. key)
+		end
+		return keyDown(key)
 	end
 	_G.GetCursorInfo = function()
 		return nil
@@ -1163,37 +1977,33 @@ function M.Install()
 	_G.debugstack = function()
 		return ""
 	end
+	-- C_Timer, driven by mock.Advance: a callback runs on the first frame at or after its time. NewTimer / NewTicker
+	-- return a handle (Cancel, IsCancelled) that is also passed to the callback; NewTicker's third argument limits the
+	-- number of calls.
+	local function newTimer(sec, fn, every, iterations)
+		timerSeq = timerSeq + 1
+		local t = { at = M.now + (sec or 0), fn = fn, every = every, left = iterations, seq = timerSeq }
+		t.handle = {
+			Cancel = function()
+				t.cancelled = true
+			end,
+			IsCancelled = function()
+				return t.cancelled or false
+			end,
+		}
+		M.timers[#M.timers + 1] = t
+		return t
+	end
 	_G.C_Timer = {
 		After = function(sec, fn)
-			M.timers[#M.timers + 1] = { at = M.now + sec, fn = fn }
+			local t = newTimer(sec, fn)
+			t.handle = nil
 		end,
 		NewTimer = function(sec, fn)
-			local t = { at = M.now + sec }
-			local handle = {
-				Cancel = function()
-					t.cancelled = true
-				end,
-				IsCancelled = function()
-					return t.cancelled
-				end,
-			}
-			t.handle, t.fn = handle, fn
-			M.timers[#M.timers + 1] = t
-			return handle
+			return newTimer(sec, fn).handle
 		end,
-		NewTicker = function(sec, fn)
-			local t = { at = M.now + sec, every = sec }
-			local handle = {
-				Cancel = function()
-					t.cancelled = true
-				end,
-				IsCancelled = function()
-					return t.cancelled
-				end,
-			}
-			t.handle, t.fn = handle, fn
-			M.timers[#M.timers + 1] = t
-			return handle
+		NewTicker = function(sec, fn, iterations)
+			return newTimer(sec, fn, sec, iterations).handle
 		end,
 	}
 	_G.C_AddOns = {
@@ -1276,9 +2086,6 @@ function M.Install()
 			return nil
 		end,
 	}
-	_G.IsShiftKeyDown = function()
-		return M.shiftDown or false
-	end
 	local function unitField(unit, field, default)
 		local u = M.units[unit]
 		if u == nil then
@@ -1353,39 +2160,121 @@ function M.Install()
 	_G.ButtonFrameTemplate_HidePortrait = function(f)
 		f._noPortrait = true
 	end
-	_G.MenuUtil = {
-		CreateContextMenu = function(region, generator)
-			local root
-			root = {
-				items = {},
-				CreateButton = function(self, text, fn)
-					local item = { text = text, fn = fn, items = {} }
-					setmetatable(item, { __index = root })
-					table.insert(self.items, item)
-					return item
-				end,
-				CreateRadio = function(self, text, isSelected, setSelected, data)
-					table.insert(self.items, { text = text, isSelected = isSelected, setSelected = setSelected, data = data })
-				end,
-				CreateDivider = noop,
-				CreateTitle = noop,
-			}
-			generator(region, root)
-			M.lastMenu = root
-			return root
-		end,
-	}
+	_G.MenuResponse, _G.MenuInputContext = MENU_RESPONSE, MENU_INPUT
+	local MenuUtil = setmetatable({}, { __index = function(_, k)
+		if type(k) == "string" and k:match("^%u") then
+			return noop
+		end
+		return nil
+	end })
+	for name, create in pairs(CREATE) do
+		MenuUtil[name] = create
+	end
+	MenuUtil.CreateRootMenuDescription = function()
+		return newDesc("root")
+	end
+	MenuUtil.CreateContextMenu = function(owner, generator, ...)
+		local root = newDesc("root")
+		local menu = openMenu(owner, root)
+		generator(owner, root, ...)
+		return menu
+	end
+	-- CreateButtonContextMenu(owner, { text, callback, data }, ...); the checkbox and radio forms take isSelected and
+	-- setSelected first, then { text, data } entries.
+	MenuUtil.CreateButtonContextMenu = function(owner, ...)
+		local entries = { ... }
+		return MenuUtil.CreateContextMenu(owner, function(_, root)
+			for _, e in ipairs(entries) do
+				root:CreateButton(e[1], e[2], e[3])
+			end
+		end)
+	end
+	for _, kind in ipairs({ "Checkbox", "Radio" }) do
+		MenuUtil["Create" .. kind .. "ContextMenu"] = function(owner, isSelected, setSelected, ...)
+			local entries = { ... }
+			return MenuUtil.CreateContextMenu(owner, function(_, root)
+				for _, e in ipairs(entries) do
+					root["Create" .. kind](root, e[1], isSelected, setSelected, e[2])
+				end
+			end)
+		end
+	end
+	MenuUtil.SetElementText = function(d, text)
+		d.text = text
+	end
+	MenuUtil.GetElementText = function(d)
+		return d.text
+	end
+	local function traverse(d, op, condition)
+		if condition == nil or condition(d) then
+			if op(d) then
+				return true
+			end
+		end
+		for _, e in ipairs(d.elements or {}) do
+			if traverse(e, op, condition) then
+				return true
+			end
+		end
+		return false
+	end
+	MenuUtil.TraverseMenu = traverse
+	MenuUtil.GetSelections = function(d, condition)
+		local out = {}
+		traverse(d, function(e)
+			if e:IsSelected() then
+				out[#out + 1] = e
+			end
+		end, condition)
+		return out
+	end
+	_G.MenuUtil = MenuUtil
 	_G.C_UIFileAsset = {
 		IsKnownFile = function()
 			return true
 		end,
 	}
+	-- Items the tests describe: M.items[itemID] = { name, itemType, itemSubType, itemEquipLoc, icon, classID,
+	-- subClassID } (fields by those names). GetItemInfoInstant (global and C_Item) takes an item ID, an item link or
+	-- string ("item:123:..."), or the name of an item listed there, and returns the client's seven values (itemID,
+	-- itemType, itemSubType, itemEquipLoc, icon, classID, subClassID), or nothing for an item not listed.
+	M.items = {}
+	local function itemID(item)
+		if type(item) == "number" then
+			return item
+		elseif type(item) ~= "string" then
+			return nil
+		end
+		local id = tonumber(item) or tonumber(item:match("item:(%d+)"))
+		if id then
+			return id
+		end
+		local found
+		for k, info in pairs(M.items) do
+			if info.name == item and (not found or k < found) then
+				found = k
+			end
+		end
+		return found
+	end
+	local function getItemInfoInstant(item)
+		local id = itemID(item)
+		local info = id and M.items[id]
+		if not info then
+			return nil
+		end
+		return id, info.itemType, info.itemSubType, info.itemEquipLoc or "", info.icon, info.classID, info.subClassID
+	end
+	_G.GetItemInfoInstant = getItemInfoInstant
 	_G.C_Item = {
+		GetItemInfoInstant = getItemInfoInstant,
 		GetItemNameByID = function(id)
-			return "Item " .. id
+			local info = M.items[itemID(id) or id]
+			return info and info.name or ("Item " .. id)
 		end,
-		GetItemIconByID = function()
-			return 134400
+		GetItemIconByID = function(id)
+			local info = M.items[itemID(id) or id]
+			return info and info.icon or 134400
 		end,
 	}
 	_G.print = function(...)

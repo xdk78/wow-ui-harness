@@ -44,6 +44,47 @@ mock.FireEvent("PLAYER_LOGIN")
 The same mock serves ordinary unit tests: without `wowui.layout` geometry getters return fixed placeholders and
 nothing is resolved, so test runs stay fast.
 
+#### Client behaviour in unit tests
+
+Scripts, sizes and visibility work as in the client, so tests can drive an addon the way a player does:
+
+- **Scripts:** `GetScript` returns the handler `SetScript` set; `HookScript` on a script without a handler sets it,
+  otherwise adds a hook that runs after the handler and earlier hooks; `SetScript` drops the script's hooks.
+  `mock.FireScript(frame, "OnClick", "LeftButton", false)` runs handler and hooks (events, `OnUpdate`, `OnShow`...
+  use it too). Calling `frame:GetScript(name)(frame, ...)` runs the handler only, as in the client.
+- **Visibility:** `Show` / `Hide` / `SetShown` / `SetParent` fire `OnShow` / `OnHide` when visibility really changes,
+  on the frame and each of its own shown descendants, parent first; `Show` on a shown frame, or on a frame whose parent
+  is hidden, fires nothing. `OnUpdate` runs only for visible frames.
+- **Sizes:** `SetSize` / `SetWidth` / `SetHeight` fire `OnSizeChanged(self, width, height)` when the size really
+  changes (the resolved size with `wowui.layout`; not re-entered from the frame's own handler). Sizes that change
+  through anchors are settled by `wowui.layout.SettleSizes(mock)` (the runner does it before each dump).
+- **Text and mouse:** `FontString:IsTruncated()` compares the text's width (6 units a character) with a set width,
+  over `SetMaxLines` and the lines a set height holds (with layout: the real measurement); `IsMouseEnabled` returns
+  what `EnableMouse` set (true until then).
+- **Input:** `mock.SetCursor(x, y)` (`GetCursorPosition`), `mock.SetMouseButtonDown(button, down)`
+  (`IsMouseButtonDown`), `mock.SetKeyDown(key, down)` (`IsShiftKeyDown`, `IsControlKeyDown`, `IsAltKeyDown`,
+  `IsMetaKeyDown`, `IsModifierKeyDown`, the left / right forms, `IsKeyDown`; keys `"SHIFT"`, `"LCTRL"`, `"RALT"`...),
+  `mock.ResetInput()`, and `mock.WithInput({ cursor = { x, y }, keys = { "SHIFT" }, buttons = { "LeftButton" } }, fn)`,
+  which puts the previous input back afterwards (also on error).
+- **Interaction sequences:** `mock.Click(button, "RightButton")` (OnMouseDown, OnMouseUp, then PreClick / OnClick /
+  PostClick for an enabled button registered for that click with `RegisterForClicks`, default `"LeftButtonUp"`; a
+  check button toggles first), `mock.Drag(frame, { from = { x, y }, to = { x, y }, steps = 4, elapsed = 1 / 60 })`
+  (OnMouseDown; OnDragStart after the first move for a frame registered with `RegisterForDrag`; a frame of
+  `mock.Advance(elapsed)` per step with the cursor moving; OnDragStop; OnMouseUp), `mock.Hover(frame)` /
+  `mock.Leave(frame)` (OnEnter / OnLeave, `IsMouseOver`), `mock.Wheel(frame, delta)`.
+- **Time:** `mock.Advance(seconds)` is one frame (OnUpdate, then the due `C_Timer` callbacks, earliest first; a ticker
+  fires at most once a frame; `NewTicker`'s iterations count); `mock.Advance(seconds, step)` runs frames of `step`.
+- **Menus:** `MenuUtil.CreateContextMenu(owner, generator, ...)` builds Blizzard_Menu's element descriptions
+  (`CreateButton`, `CreateCheckbox`, `CreateRadio`, `CreateTitle`, `CreateDivider`, `CreateSpacer`, `CreateTemplate`,
+  `CreateColorSwatch`, submenus, `Queue*`, `SetEnabled(boolean or function(description))`, `SetCanSelect`,
+  `SetResponse`, `SetTooltip`, `Pick`) and returns the menu, also `mock.lastMenu`. In tests:
+  `menu:Click("Sort", "By name")` picks an element by its texts (nothing for a disabled one; the responder gets
+  `data, { context, buttonName }, menu`; the response closes the menu as the client's does), `menu:Find(...)`,
+  `menu:Lines()` (`"checkbox [x] Show"`, `"button Delete (disabled)"`, indented submenus), `menu:IsOpen()`.
+- **Items:** `mock.items[itemID] = { name, itemType, itemSubType, itemEquipLoc, icon, classID, subClassID }` (after
+  `Install`); `GetItemInfoInstant` / `C_Item.GetItemInfoInstant` take an ID, a link or a listed name and return the
+  client's seven values, or nothing.
+
 ### 2. Describe your views and run the dump
 
 ```lua

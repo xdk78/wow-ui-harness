@@ -357,22 +357,28 @@ end
 -- Enable --------------------------------------------------------------------------------------------------------------
 
 -- The client fires OnSizeChanged when a frame's resolved size changes (also when anchors, not SetSize, change it, and
--- the first time it gets a size). The mock resolves sizes lazily, so this does the same on demand: every shown frame
--- with an OnSizeChanged script whose size differs from the last one it was told gets the call, repeated until nothing
--- changes (handlers that resize their children cascade), at most `passes` times. Returns the number of calls made.
+-- the first time it gets a size). The mock fires it at once for SetSize / SetWidth / SetHeight; sizes that change
+-- through anchors are resolved lazily, so this does the rest on demand: every shown frame with an OnSizeChanged script
+-- whose size differs from the last one it was told gets the call (handler and hooks), repeated until nothing changes
+-- (handlers that resize their children cascade), at most `passes` times. Returns the number of calls made.
 function Layout.SettleSizes(M, passes)
 	local calls = 0
 	for _ = 1, passes or 8 do
 		local changed = false
 		for _, f in ipairs(M.frames or {}) do
-			local fn = f._scripts and f._scripts.OnSizeChanged
-			if fn and Layout.Visible(f) then
+			local has = (f._scripts and f._scripts.OnSizeChanged) or (f._hooks and f._hooks.OnSizeChanged)
+			if has and Layout.Visible(f) then
 				local w, h = f:GetWidth() or 0, f:GetHeight() or 0
 				local last = f._settledSize
 				if not last or math.abs(last[1] - w) > 0.01 or math.abs(last[2] - h) > 0.01 then
 					f._settledSize = { w, h }
 					if w > 0 or h > 0 or last then
-						fn(f, w, h)
+						f._inSizeChanged = true
+						local ok, err = pcall(M.FireScript, f, "OnSizeChanged", w, h)
+						f._inSizeChanged = nil
+						if not ok then
+							error(err, 0)
+						end
 						calls = calls + 1
 						changed = true
 						M.gen = (M.gen or 0) + 1

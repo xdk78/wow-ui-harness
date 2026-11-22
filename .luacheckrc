@@ -30,6 +30,10 @@ files["lib/"] = {
 
 files["tests/"] = {
 	globals = { "_G", "LibStub", "Screenshot" },
-	read_globals = { "arg", "CreateFrame", "UIParent", "C_Timer", "GetFileIDFromPath" },
+	read_globals = {
+		"arg", "CreateFrame", "UIParent", "C_Timer", "GetFileIDFromPath", "C_Item", "GetItemInfoInstant", "MenuUtil",
+		"MenuResponse", "GetCursorPosition", "IsMouseButtonDown", "IsShiftKeyDown", "IsLeftShiftKeyDown",
+		"IsControlKeyDown", "IsAltKeyDown", "IsModifierKeyDown", "IsKeyDown",
+	},
 }
 files["examples/"] = { read_globals = { "arg", "CreateFrame", "UIParent" } }
